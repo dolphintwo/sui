@@ -2,33 +2,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { useEffect } from 'react';
-import { Navigate, Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 
-import { DappTxApprovalPage } from './pages/dapp-tx-approval';
-import HomePage from './pages/home';
-import NftsPage from './pages/home/nfts';
-import SettingsPage from './pages/home/settings';
-import TokensPage from './pages/home/tokens';
-import TransactionsPage from './pages/home/transactions';
-import InitializePage from './pages/initialize';
-import BackupPage from './pages/initialize/backup';
-import CreatePage from './pages/initialize/create';
-import ImportPage from './pages/initialize/import';
-import SelectPage from './pages/initialize/select';
-import SiteConnectPage from './pages/site-connect';
-import TransactionDetailsPage from './pages/transaction-details';
-import TransferCoinPage from './pages/transfer-coin';
-import TransferNFTPage from './pages/transfer-nft';
-import WelcomePage from './pages/welcome';
 import { AppType } from './redux/slices/app/AppType';
 import { useAppDispatch, useAppSelector } from '_hooks';
+import { DappTxApprovalPage } from '_pages/dapp-tx-approval';
+import HomePage, {
+    NftsPage,
+    StakeNew,
+    StakePage,
+    TokensPage,
+    TransactionDetailsPage,
+    TransactionsPage,
+    TransferCoinPage,
+    TransferNFTPage,
+} from '_pages/home';
+import InitializePage from '_pages/initialize';
+import BackupPage from '_pages/initialize/backup';
+import CreatePage from '_pages/initialize/create';
+import ImportPage from '_pages/initialize/import';
+import SelectPage from '_pages/initialize/select';
+import SiteConnectPage from '_pages/site-connect';
+import WelcomePage from '_pages/welcome';
 import { loadAccountFromStorage } from '_redux/slices/account';
-import { loadNetworkFromStorage } from '_redux/slices/app';
+import { setNavVisibility } from '_redux/slices/app';
+
+const HIDDEN_MENU_PATHS = ['/stake-new'];
 
 const App = () => {
     const dispatch = useAppDispatch();
     useEffect(() => {
-        dispatch(loadNetworkFromStorage());
         dispatch(loadAccountFromStorage());
     }, [dispatch]);
     const isPopup = useAppSelector(
@@ -37,6 +40,11 @@ const App = () => {
     useEffect(() => {
         document.body.classList[isPopup ? 'add' : 'remove']('is-popup');
     }, [isPopup]);
+    const location = useLocation();
+    useEffect(() => {
+        const menuVisible = !HIDDEN_MENU_PATHS.includes(location.pathname);
+        dispatch(setNavVisibility(menuVisible));
+    }, [location, dispatch]);
     return (
         <Routes>
             <Route path="/" element={<HomePage />}>
@@ -47,9 +55,12 @@ const App = () => {
                 <Route path="tokens" element={<TokensPage />} />
                 <Route path="nfts" element={<NftsPage />} />
                 <Route path="transactions" element={<TransactionsPage />} />
-                <Route path="settings" element={<SettingsPage />} />
                 <Route path="send" element={<TransferCoinPage />} />
                 <Route path="send-nft" element={<TransferNFTPage />} />
+                <Route path="stake" element={<StakePage />} />
+                {process.env.NODE_ENV === 'development' ? (
+                    <Route path="stake-new" element={<StakeNew />} />
+                ) : null}
                 <Route
                     path="tx/:txDigest"
                     element={<TransactionDetailsPage />}

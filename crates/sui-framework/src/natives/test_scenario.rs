@@ -3,6 +3,7 @@
 
 use crate::EventType;
 use core::panic;
+use linked_hash_map::LinkedHashMap;
 use move_binary_format::errors::PartialVMResult;
 use move_core_types::{account_address::AccountAddress, value::MoveTypeLayout};
 use move_vm_runtime::native_functions::NativeContext;
@@ -52,7 +53,7 @@ struct OwnedObj {
 // This will require extending NativeContext with a function to map `Type` (which is just an index
 // into the module's StructHandle table for structs) to something human-readable like `TypeTag`.
 // TODO: add a native function that prints the log of transfers, deletes, wraps for debugging purposes
-type Inventory = BTreeMap<ObjectID, OwnedObj>;
+type Inventory = LinkedHashMap<ObjectID, OwnedObj>;
 
 /// Return the object ID involved in an event.
 /// This depends on the value format for each event type.
@@ -65,8 +66,7 @@ fn get_object_id_from_event(event_type_byte: u64, val: &Value) -> Option<ObjectI
     } else {
         let event_type = EventType::try_from_primitive(event_type_byte as u8).unwrap();
         match event_type {
-            EventType::DeleteChildObject => val,
-            EventType::DeleteObjectID => get_nested_struct_field(val, &[0, 0, 0]).unwrap(),
+            EventType::DeleteObjectID => get_nested_struct_field(val, &[0, 0]).unwrap(),
             EventType::User => {
                 return None;
             }
@@ -152,7 +152,7 @@ fn get_global_inventory(events: &[Event]) -> Result<Inventory, u64> {
                     },
                 );
             }
-            EventType::DeleteObjectID | EventType::DeleteChildObject => {
+            EventType::DeleteObjectID => {
                 // note: obj_id may or may not be present in `inventory`--a useer can create an ID and delete it without associating it with a transferred object
                 inventory.remove(&obj_id);
             }
@@ -197,7 +197,7 @@ fn get_inventory_for(
                     let obj_signer = obj.signer.unwrap();
                     obj.owner
                         == Owner::ObjectOwner(SuiAddress::try_from(parent.as_slice()).unwrap())
-                        && (!obj_signer.is_owned() || obj_signer == signer)
+                        && (!obj_signer.is_owned_or_quasi_shared() || obj_signer == signer)
                 } else {
                     obj.owner == signer
                 }

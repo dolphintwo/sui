@@ -2,7 +2,13 @@
 title: Using the Sui Wallet Browser Extension
 ---
 
-Welcome to the [Sui Wallet Browser Chrome Extension](https://chrome.google.com/webstore/detail/sui-wallet/albddfdbohgeonpapellnjadnddglhgn?hl=en&authuser=0). The Sui Wallet Browser Extension acts as your portal to the Web3 world. Follow this guide to install and use the extension. 
+Welcome to the [Sui Wallet Browser Chrome Extension](https://chrome.google.com/webstore/detail/sui-wallet/opcgpfmipidbgpenhmajoajpbobppdil). The Sui Wallet Browser Extension acts as your portal to the Web3 world. Follow this guide to install and use the extension.
+
+## Purpose
+
+Initially, the Sui Wallet Browser Extension is aimed at Sui developers for testing purposes. As such, the tokens are of no value (just like the rest of [DevNet](../explore/devnet.md)) and will disappear each time we reset the network. In time, the Sui Wallet Browser Extension will be production ready for real tokens.
+
+This browser extension is a pared-down version of the [Sui CLI client](../build/cli-client.md) that provides greater ease of use for the most commonly used features. If you need more advanced features, such as merging/splitting coins and making arbitrary [Move](../build/move/index.md) calls, instead use the [Sui CLI client](../build/cli-client.md).
 
 ## Features
 
@@ -19,12 +25,6 @@ The Sui Wallet Browser Extension offers these features:
 
 See [Demos](#demos) for depictions of these features in play and [Use](#use) to find these features in navigation.
 
-## Purpose
-
-Initially, the Sui Wallet Browser Extension is aimed at Sui developers for testing purposes. As such, the tokens are of no value (just like the rest of [DevNet](../explore/devnet.md)) and will disappear each time we reset the network. In time, the Sui Wallet Browser Extension will be production ready for real tokens.
-
-This browser extension is a pared-down version of the [Sui CLI client)](../build/cli-client.md) that provides greater ease of use for the most commonly used features. If you need more advanced features, such as merging/splitting coins and making arbitrary [Move](../build/move.md) calls, instead use the [Sui CLI client](../build/cli-client.md).
-
 ## Demos
 
 The following animated GIFs walk you through some of the most common workflows in the Sui Wallet Browser Extension.
@@ -33,41 +33,41 @@ The following animated GIFs walk you through some of the most common workflows i
 
 Install and configure the Sui Wallet Browser Extension (covered in detail starting with [Install](#install)):
 
-![Set up Wallet](../../static/onboarding.gif "Set up Wallet")
+![Set up Wallet](../../static/wallet_0.0.2/set_up_wallet.gif "Set up Wallet")
 *Set up the Sui Wallet Browser Extension*
 
 ### Create NFT
 
 From a demo decentralized site, such as our demonstration [NFT dApp](https://github.com/MystenLabs/sui/tree/main/wallet/examples/demo-nft-dapp) available [in the Cloud](http://sui-wallet-demo.s3-website-us-east-1.amazonaws.com/), you can connect to your wallet and create a custom NFT:
 
-![Create NFT](../../static/create_NFT.gif "Create NFT")
+![Create NFT](../../static/wallet_0.0.2/create_nft.gif "Create NFT")
 *Create an NFT in Sui Wallet by connecting to an external site*
 
 ### Transfer NFT
 
 Transfer your NFT to another address using the Sui Wallet Browser Extension:
 
-![Transfer NFT](../../static/nft_transfer.gif "Transfer NFT")
+![Transfer NFT](../../static/wallet_0.0.2/transfer_nft.gif "Transfer NFT")
 *Transfer your NFT to another address*
 
 ### Transfer token
 
 Transfer your token to another address on the Sui network using the Sui Wallet Browser Extension:
 
-![Transfer token](../../static/nft_transfer.gif "Transfer token")
+![Transfer token](../../static/wallet_0.0.2/transfer_token.gif "Transfer token")
 *Transfer tokens to another address*
 
 ### View transaction history
 
 View your recent transactions and visit [Sui Explorer](https://explorer.devnet.sui.io/), where you can see more details about the corresponding transaction:
 
-![Transaction history and settings](../../static/txn_history_and_settings.gif "Transaction history and settings")
+![Transaction history and settings](../../static/wallet_0.0.2/txn_history.gif "Transaction history and settings")
 *Under the *Settings* tab, view your account on Sui Explorer*
 
 ## Install
 
 To install the Sui Wallet Browser Extension:
-1. Visit its [link in the Chrome Webstore](https://chrome.google.com/webstore/detail/sui-wallet/albddfdbohgeonpapellnjadnddglhgn?hl=en&authuser=0).
+1. Visit its [link in the Chrome Webstore](https://chrome.google.com/webstore/detail/sui-wallet/opcgpfmipidbgpenhmajoajpbobppdil).
 1. Click **Install**.
 1. Optionally, [pin the extension](https://www.howtogeek.com/683099/how-to-pin-and-unpin-extensions-from-the-chrome-toolbar/) to add it to your toolbar for easy access.
 

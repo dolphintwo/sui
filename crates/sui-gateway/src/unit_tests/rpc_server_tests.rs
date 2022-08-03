@@ -7,14 +7,14 @@ use sui_config::SUI_KEYSTORE_FILENAME;
 use sui_core::gateway_state::GatewayTxSeqNumber;
 use sui_framework::build_move_package_to_bytes;
 use sui_json::SuiJsonValue;
-use sui_json_rpc_api::keystore::{Keystore, SuiKeystore};
-use sui_json_rpc_api::rpc_types::{
-    GetObjectDataResponse, TransactionEffectsResponse, TransactionResponse,
+use sui_json_rpc::api::{
+    RpcGatewayApiClient, RpcReadApiClient, RpcTransactionBuilderClient, WalletSyncApiClient,
 };
-use sui_json_rpc_api::{
-    RpcGatewayApiClient, RpcReadApiClient, RpcTransactionBuilderClient, TransactionBytes,
-    WalletSyncApiClient,
+use sui_json_rpc_types::{
+    GetObjectDataResponse, TransactionBytes, TransactionEffectsResponse, TransactionResponse,
 };
+use sui_sdk::crypto::{Keystore, SuiKeystore};
+use sui_types::crypto::SuiSignature;
 use sui_types::sui_serde::Base64;
 use sui_types::{
     base_types::{ObjectID, TransactionDigest},
@@ -44,7 +44,7 @@ async fn test_public_transfer_object() -> Result<(), anyhow::Error> {
     let objects = http_client.get_objects_owned_by_address(*address).await?;
 
     let tx_data: TransactionBytes = http_client
-        .public_transfer_object(
+        .transfer_object(
             *address,
             objects.first().unwrap().object_id,
             Some(objects.last().unwrap().object_id),
@@ -59,11 +59,12 @@ async fn test_public_transfer_object() -> Result<(), anyhow::Error> {
     let signature = keystore.sign(address, &tx_bytes)?;
 
     let tx_bytes = Base64::from_bytes(&tx_bytes);
+    let flag_bytes = Base64::from_bytes(&[signature.flag_byte()]);
     let signature_bytes = Base64::from_bytes(signature.signature_bytes());
     let pub_key = Base64::from_bytes(signature.public_key_bytes());
 
     let tx_response: TransactionResponse = http_client
-        .execute_transaction(tx_bytes, signature_bytes, pub_key)
+        .execute_transaction(tx_bytes, flag_bytes, signature_bytes, pub_key)
         .await?;
 
     let effect = tx_response.to_effect_response()?.effects;
@@ -99,11 +100,12 @@ async fn test_publish() -> Result<(), anyhow::Error> {
     let signature = keystore.sign(address, &tx_bytes)?;
 
     let tx_bytes = Base64::from_bytes(&tx_bytes);
+    let flag_bytes = Base64::from_bytes(&[signature.flag_byte()]);
     let signature_bytes = Base64::from_bytes(signature.signature_bytes());
     let pub_key = Base64::from_bytes(signature.public_key_bytes());
 
     let tx_response: TransactionResponse = http_client
-        .execute_transaction(tx_bytes, signature_bytes, pub_key)
+        .execute_transaction(tx_bytes, flag_bytes, signature_bytes, pub_key)
         .await?;
 
     let response = tx_response.to_publish_response()?;
@@ -148,11 +150,12 @@ async fn test_move_call() -> Result<(), anyhow::Error> {
     let signature = keystore.sign(address, &tx_bytes)?;
 
     let tx_bytes = Base64::from_bytes(&tx_bytes);
+    let flag_bytes = Base64::from_bytes(&[signature.flag_byte()]);
     let signature_bytes = Base64::from_bytes(signature.signature_bytes());
     let pub_key = Base64::from_bytes(signature.public_key_bytes());
 
     let tx_response: TransactionResponse = http_client
-        .execute_transaction(tx_bytes, signature_bytes, pub_key)
+        .execute_transaction(tx_bytes, flag_bytes, signature_bytes, pub_key)
         .await?;
 
     let effect = tx_response.to_effect_response()?.effects;
@@ -192,7 +195,7 @@ async fn test_get_transaction() -> Result<(), anyhow::Error> {
     let mut tx_responses = Vec::new();
     for oref in &objects[..objects.len() - 1] {
         let tx_data: TransactionBytes = http_client
-            .public_transfer_object(*address, oref.object_id, Some(gas_id), 1000, *address)
+            .transfer_object(*address, oref.object_id, Some(gas_id), 1000, *address)
             .await?;
 
         let keystore =
@@ -201,11 +204,12 @@ async fn test_get_transaction() -> Result<(), anyhow::Error> {
         let signature = keystore.sign(address, &tx_bytes)?;
 
         let tx_bytes = Base64::from_bytes(&tx_bytes);
+        let flag_bytes = Base64::from_bytes(&[signature.flag_byte()]);
         let signature_bytes = Base64::from_bytes(signature.signature_bytes());
         let pub_key = Base64::from_bytes(signature.public_key_bytes());
 
         let response: TransactionResponse = http_client
-            .execute_transaction(tx_bytes, signature_bytes, pub_key)
+            .execute_transaction(tx_bytes, flag_bytes, signature_bytes, pub_key)
             .await?;
 
         if let TransactionResponse::EffectResponse(effects) = response {

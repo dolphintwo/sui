@@ -3,21 +3,20 @@
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use ed25519_dalek::ed25519::signature::Signature;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_core::server::rpc_module::RpcModule;
+use signature::Signature;
 use tracing::debug;
 
+use crate::api::{
+    RpcGatewayApiServer, RpcReadApiServer, RpcTransactionBuilderServer, WalletSyncApiServer,
+};
 use crate::SuiRpcModule;
 use sui_core::gateway_state::{GatewayClient, GatewayTxSeqNumber};
 use sui_json::SuiJsonValue;
-use sui_json_rpc_api::rpc_types::{
-    GetObjectDataResponse, SuiObjectInfo, TransactionEffectsResponse, TransactionResponse,
-};
-use sui_json_rpc_api::rpc_types::{RPCTransactionRequestParams, SuiTypeTag};
-use sui_json_rpc_api::{
-    RpcGatewayApiServer, RpcReadApiServer, RpcTransactionBuilderServer, TransactionBytes,
-    WalletSyncApiServer,
+use sui_json_rpc_types::{
+    GetObjectDataResponse, RPCTransactionRequestParams, SuiObjectInfo, SuiTypeTag,
+    TransactionBytes, TransactionEffectsResponse, TransactionResponse,
 };
 use sui_open_rpc::Module;
 use sui_types::sui_serde::Base64;
@@ -72,13 +71,15 @@ impl RpcGatewayApiServer for RpcGatewayImpl {
     async fn execute_transaction(
         &self,
         tx_bytes: Base64,
+        flag: Base64,
         signature: Base64,
         pub_key: Base64,
     ) -> RpcResult<TransactionResponse> {
         let data = TransactionData::from_signable_bytes(&tx_bytes.to_vec()?)?;
-        let signature =
-            crypto::Signature::from_bytes(&[&*signature.to_vec()?, &*pub_key.to_vec()?].concat())
-                .map_err(|e| anyhow!(e))?;
+        let signature = crypto::Signature::from_bytes(
+            &[&*flag.to_vec()?, &*signature.to_vec()?, &pub_key.to_vec()?].concat(),
+        )
+        .map_err(|e| anyhow!(e))?;
         let result = self
             .client
             .execute_transaction(Transaction::new(data, signature))
@@ -93,7 +94,7 @@ impl SuiRpcModule for RpcGatewayImpl {
     }
 
     fn rpc_doc_module() -> Module {
-        sui_json_rpc_api::RpcGatewayApiOpenRpc::module_doc()
+        crate::api::RpcGatewayApiOpenRpc::module_doc()
     }
 }
 
@@ -112,7 +113,7 @@ impl SuiRpcModule for GatewayWalletSyncApiImpl {
     }
 
     fn rpc_doc_module() -> Module {
-        sui_json_rpc_api::WalletSyncApiOpenRpc::module_doc()
+        crate::api::WalletSyncApiOpenRpc::module_doc()
     }
 }
 
@@ -171,13 +172,13 @@ impl SuiRpcModule for GatewayReadApiImpl {
     }
 
     fn rpc_doc_module() -> Module {
-        sui_json_rpc_api::RpcReadApiOpenRpc::module_doc()
+        crate::api::RpcReadApiOpenRpc::module_doc()
     }
 }
 
 #[async_trait]
 impl RpcTransactionBuilderServer for TransactionBuilderImpl {
-    async fn public_transfer_object(
+    async fn transfer_object(
         &self,
         signer: SuiAddress,
         object_id: ObjectID,
@@ -308,6 +309,6 @@ impl SuiRpcModule for TransactionBuilderImpl {
     }
 
     fn rpc_doc_module() -> Module {
-        sui_json_rpc_api::RpcTransactionBuilderOpenRpc::module_doc()
+        crate::api::RpcTransactionBuilderOpenRpc::module_doc()
     }
 }

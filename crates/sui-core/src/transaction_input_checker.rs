@@ -1,113 +1,29 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-
-use prometheus::IntCounter;
+use crate::authority::SuiDataStore;
 use serde::{Deserialize, Serialize};
-use sui_types::base_types::TransactionDigest;
+use std::collections::HashSet;
+use std::fmt::Debug;
 use sui_types::{
-    base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress},
+    base_types::{ObjectID, SequenceNumber, SuiAddress},
     error::{SuiError, SuiResult},
     fp_ensure,
     gas::{self, SuiGasStatus},
-    messages::{InputObjectKind, SingleTransactionKind, TransactionData, TransactionEnvelope},
+    messages::{
+        InputObjectKind, InputObjects, SingleTransactionKind, TransactionData, TransactionEnvelope,
+    },
     object::{Object, Owner},
 };
-use tracing::{debug, instrument};
-
-use crate::authority::SuiDataStore;
-
-pub struct InputObjects {
-    objects: Vec<(InputObjectKind, Object)>,
-}
-
-impl InputObjects {
-    pub fn new(objects: Vec<(InputObjectKind, Object)>) -> Self {
-        Self { objects }
-    }
-
-    pub fn len(&self) -> usize {
-        self.objects.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
-    }
-
-    pub fn filter_owned_objects(&self) -> Vec<ObjectRef> {
-        let owned_objects: Vec<_> = self
-            .objects
-            .iter()
-            .filter_map(|(object_kind, object)| match object_kind {
-                InputObjectKind::MovePackage(_) => None,
-                InputObjectKind::ImmOrOwnedMoveObject(object_ref) => {
-                    if object.is_immutable() {
-                        None
-                    } else {
-                        Some(*object_ref)
-                    }
-                }
-                InputObjectKind::SharedMoveObject(_) => None,
-            })
-            .collect();
-
-        debug!(
-            num_mutable_objects = owned_objects.len(),
-            "Checked locks and found mutable objects"
-        );
-
-        owned_objects
-    }
-
-    pub fn filter_shared_objects(&self) -> Vec<ObjectRef> {
-        self.objects
-            .iter()
-            .filter(|(kind, _)| matches!(kind, InputObjectKind::SharedMoveObject(_)))
-            .map(|(_, obj)| obj.compute_object_reference())
-            .collect()
-    }
-
-    pub fn transaction_dependencies(&self) -> BTreeSet<TransactionDigest> {
-        self.objects
-            .iter()
-            .map(|(_, obj)| obj.previous_transaction)
-            .collect()
-    }
-
-    pub fn mutable_inputs(&self) -> Vec<ObjectRef> {
-        self.objects
-            .iter()
-            .filter_map(|(kind, object)| match kind {
-                InputObjectKind::MovePackage(_) => None,
-                InputObjectKind::ImmOrOwnedMoveObject(object_ref) => {
-                    if object.is_immutable() {
-                        None
-                    } else {
-                        Some(*object_ref)
-                    }
-                }
-                InputObjectKind::SharedMoveObject(_) => Some(object.compute_object_reference()),
-            })
-            .collect()
-    }
-
-    pub fn into_object_map(self) -> BTreeMap<ObjectID, Object> {
-        self.objects
-            .into_iter()
-            .map(|(_, object)| (object.id(), object))
-            .collect()
-    }
-}
+use tracing::instrument;
 
 #[instrument(level = "trace", skip_all)]
 pub async fn check_transaction_input<S, T>(
     store: &SuiDataStore<S>,
     transaction: &TransactionEnvelope<T>,
-    shared_obj_metric: &IntCounter,
 ) -> Result<(SuiGasStatus<'static>, InputObjects), SuiError>
 where
-    S: Eq + Serialize + for<'de> Deserialize<'de>,
+    S: Eq + Debug + Serialize + for<'de> Deserialize<'de>,
 {
     let mut gas_status = check_gas(
         store,
@@ -118,11 +34,9 @@ where
     )
     .await?;
 
-    let input_objects = check_locks(store, &transaction.data).await?;
+    let input_objects = check_objects(store, &transaction.data).await?;
 
     if transaction.contains_shared_object() {
-        shared_obj_metric.inc();
-
         // It's important that we do this here to make sure there is enough
         // gas to cover shared objects, before we lock all objects.
         gas_status.charge_consensus()?;
@@ -144,7 +58,7 @@ async fn check_gas<S>(
     is_system_tx: bool,
 ) -> SuiResult<SuiGasStatus<'static>>
 where
-    S: Eq + Serialize + for<'de> Deserialize<'de>,
+    S: Eq + Debug + Serialize + for<'de> Deserialize<'de>,
 {
     if is_system_tx {
         Ok(SuiGasStatus::new_unmetered())
@@ -174,7 +88,7 @@ async fn fetch_objects<S>(
     input_objects: &[InputObjectKind],
 ) -> Result<Vec<Option<Object>>, SuiError>
 where
-    S: Eq + Serialize + for<'de> Deserialize<'de>,
+    S: Eq + Debug + Serialize + for<'de> Deserialize<'de>,
 {
     let ids: Vec<_> = input_objects.iter().map(|kind| kind.object_id()).collect();
     store.get_objects(&ids[..])
@@ -183,12 +97,12 @@ where
 /// Check all the objects used in the transaction against the database, and ensure
 /// that they are all the correct version and number.
 #[instrument(level = "trace", skip_all)]
-async fn check_locks<S>(
+async fn check_objects<S>(
     store: &SuiDataStore<S>,
     transaction: &TransactionData,
 ) -> Result<InputObjects, SuiError>
 where
-    S: Eq + Serialize + for<'de> Deserialize<'de>,
+    S: Eq + Debug + Serialize + for<'de> Deserialize<'de>,
 {
     let input_objects = transaction.input_objects()?;
     // These IDs act as authenticators that can own other objects.
@@ -232,6 +146,7 @@ where
             }
         })
         .collect();
+
     for (object_kind, object) in input_objects.into_iter().zip(objects) {
         // All objects must exist in the DB.
         let object = match object {
@@ -246,7 +161,7 @@ where
         }
         // Check if the object contents match the type of lock we need for
         // this object.
-        match check_one_lock(
+        match check_one_object(
             &transaction.signer(),
             object_kind,
             &object,
@@ -261,7 +176,7 @@ where
     // If any errors with the locks were detected, we return all errors to give the client
     // a chance to update the authority if possible.
     if !errors.is_empty() {
-        return Err(SuiError::LockErrors { errors });
+        return Err(SuiError::ObjectErrors { errors });
     }
     fp_ensure!(!all_objects.is_empty(), SuiError::ObjectInputArityViolation);
 
@@ -270,7 +185,7 @@ where
 
 /// The logic to check one object against a reference, and return the object if all is well
 /// or an error if not.
-fn check_one_lock(
+fn check_one_object(
     sender: &SuiAddress,
     object_kind: InputObjectKind,
     object: &Object,
@@ -290,8 +205,10 @@ fn check_one_lock(
                 !object.is_package(),
                 SuiError::MovePackageAsObject { object_id }
             );
+            // wrapped objects that are then deleted will be set to MAX,
+            // so we need to cap the sequence number at MAX - 1
             fp_ensure!(
-                sequence_number < SequenceNumber::MAX,
+                sequence_number < SequenceNumber::MAX.decrement().unwrap(),
                 SuiError::InvalidSequenceNumber
             );
 

@@ -13,6 +13,13 @@ export interface TransferObjectTransaction {
   recipient: SuiAddress;
 }
 
+export interface TransferSuiTransaction {
+  suiObjectId: ObjectId;
+  gasBudget: number;
+  recipient: SuiAddress;
+  amount?: number;
+}
+
 export interface MergeCoinTransaction {
   primaryCoin: ObjectId;
   coinToMerge: ObjectId;
@@ -37,6 +44,13 @@ export interface MoveCallTransaction {
   gasBudget: number;
 }
 
+export interface PublishTransaction {
+  compiledModules: string[],
+  gasPayment?: ObjectId;
+  gasBudget: number;
+}
+
+
 ///////////////////////////////
 // Exported Abstracts
 /**
@@ -46,6 +60,11 @@ export interface TxnDataSerializer {
   newTransferObject(
     signerAddress: SuiAddress,
     txn: TransferObjectTransaction
+  ): Promise<Base64DataBuffer>;
+
+  newTransferSui(
+    signerAddress: SuiAddress,
+    txn: TransferSuiTransaction
   ): Promise<Base64DataBuffer>;
 
   newMoveCall(
@@ -61,5 +80,10 @@ export interface TxnDataSerializer {
   newSplitCoin(
     signerAddress: SuiAddress,
     txn: SplitCoinTransaction
+  ): Promise<Base64DataBuffer>;
+
+  newPublish(
+    signerAddress: SuiAddress,
+    txn: PublishTransaction
   ): Promise<Base64DataBuffer>;
 }

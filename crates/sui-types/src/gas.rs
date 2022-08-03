@@ -6,7 +6,7 @@ use crate::{
     error::{ExecutionError, ExecutionErrorKind},
     error::{SuiError, SuiResult},
     gas_coin::GasCoin,
-    object::Object,
+    object::{Object, Owner},
 };
 use move_core_types::{
     gas_schedule::{
@@ -301,13 +301,13 @@ impl<'a> SuiGasStatus<'a> {
 }
 
 /// Check whether the given gas_object and gas_budget is legit:
-/// 1. If the gas object is owned.
+/// 1. If the gas object has an address owner.
 /// 2. If it's enough to pay the flat minimum transaction fee
 /// 3. If it's less than the max gas budget allowed
 /// 4. If the gas_object actually has enough balance to pay for the budget.
 pub fn check_gas_balance(gas_object: &Object, gas_budget: u64, gas_price: u64) -> SuiResult {
     ok_or_gas_error!(
-        gas_object.is_owned(),
+        matches!(gas_object.owner, Owner::AddressOwner(_)),
         "Gas object must be owned Move object".to_owned()
     )?;
     ok_or_gas_error!(
@@ -354,11 +354,7 @@ pub fn deduct_gas(gas_object: &mut Object, deduct_amount: u64, rebate_amount: u6
     let gas_coin = GasCoin::try_from(&*gas_object).unwrap();
     let balance = gas_coin.value();
     debug_assert!(balance >= deduct_amount);
-    let new_gas_coin = GasCoin::new(
-        *gas_coin.id(),
-        gas_object.version(),
-        balance + rebate_amount - deduct_amount,
-    );
+    let new_gas_coin = GasCoin::new(*gas_coin.id(), balance + rebate_amount - deduct_amount);
     let move_object = gas_object.data.try_as_move_mut().unwrap();
     move_object.update_contents_and_increment_version(bcs::to_bytes(&new_gas_coin).unwrap());
 }
@@ -367,7 +363,7 @@ pub fn refund_gas(gas_object: &mut Object, amount: u64) {
     // The object must be a gas coin as we have checked in transaction handle phase.
     let gas_coin = GasCoin::try_from(&*gas_object).unwrap();
     let balance = gas_coin.value();
-    let new_gas_coin = GasCoin::new(*gas_coin.id(), gas_object.version(), balance + amount);
+    let new_gas_coin = GasCoin::new(*gas_coin.id(), balance + amount);
     let move_object = gas_object.data.try_as_move_mut().unwrap();
     move_object.update_contents_and_increment_version(bcs::to_bytes(&new_gas_coin).unwrap());
 }

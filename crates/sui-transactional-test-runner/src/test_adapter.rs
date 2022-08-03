@@ -3,7 +3,7 @@
 
 //! This module contains the transactional test runner instantiation for the Sui adapter
 
-use crate::{args::*, in_memory_storage::InMemoryStorage};
+use crate::args::*;
 use anyhow::bail;
 use bimap::btree::BiBTreeMap;
 use move_binary_format::{file_format::CompiledScript, CompiledModule};
@@ -36,19 +36,20 @@ use std::{
     path::Path,
     sync::Arc,
 };
+use sui_adapter::temporary_store::TemporaryStore;
 use sui_adapter::{adapter::new_move_vm, genesis};
-use sui_core::transaction_input_checker::InputObjects;
-use sui_core::{authority::AuthorityTemporaryStore, execution_engine};
+use sui_adapter::{in_memory_storage::InMemoryStorage, temporary_store::InnerTemporaryStore};
+use sui_core::execution_engine;
 use sui_framework::DEFAULT_FRAMEWORK_PATH;
 use sui_types::{
     base_types::{
         ObjectDigest, ObjectID, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
         SUI_ADDRESS_LENGTH,
     },
-    crypto::{get_key_pair_from_rng, KeyPair, Signature},
+    crypto::{get_key_pair_from_rng, AccountKeyPair, Signature},
     event::Event,
     gas,
-    messages::{ExecutionStatus, Transaction, TransactionData, TransactionEffects},
+    messages::{ExecutionStatus, InputObjects, Transaction, TransactionData, TransactionEffects},
     object::{self, Object, ObjectFormatOptions, GAS_VALUE_FOR_TESTING},
     MOVE_STDLIB_ADDRESS, SUI_FRAMEWORK_ADDRESS,
 };
@@ -68,7 +69,7 @@ pub struct SuiTestAdapter<'a> {
     pub(crate) storage: Arc<InMemoryStorage>,
     native_functions: NativeFunctionTable,
     pub(crate) compiled_state: CompiledState<'a>,
-    accounts: BTreeMap<String, (SuiAddress, KeyPair)>,
+    accounts: BTreeMap<String, (SuiAddress, AccountKeyPair)>,
     default_syntax: SyntaxChoice,
     object_enumeration: BiBTreeMap<ObjectID, FakeID>,
     next_fake: FakeID,
@@ -128,13 +129,12 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter<'a> {
             .collect::<BTreeMap<_, _>>();
 
         let mut named_address_mapping = NAMED_ADDRESSES.clone();
-        let additional_mapping =
-            additional_mapping
-                .into_iter()
-                .chain(accounts.iter().map(|(n, (addr, _))| {
-                    let addr = NumericalAddress::new(addr.to_inner(), NumberFormat::Hex);
-                    (n.clone(), addr)
-                }));
+        let additional_mapping = additional_mapping.into_iter().chain(accounts.iter().map(
+            |(n, (addr, _)): (_, &(_, AccountKeyPair))| {
+                let addr = NumericalAddress::new(addr.to_inner(), NumberFormat::Hex);
+                (n.clone(), addr)
+            },
+        ));
         for (name, addr) in additional_mapping {
             if named_address_mapping.contains_key(&name) || name == "sui" {
                 panic!("Invalid init. The named address '{}' is reserved", name)
@@ -350,9 +350,12 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter<'a> {
         macro_rules! get_obj {
             ($fake_id:ident) => {{
                 let id = match self.fake_to_real_object_id($fake_id) {
-                    None => panic!(
+                    None => bail!(
                         "task {}, lines {}-{}. Unbound fake id {}",
-                        number, start_line, command_lines_stop, $fake_id
+                        number,
+                        start_line,
+                        command_lines_stop,
+                        $fake_id
                     ),
                     Some(res) => res,
                 };
@@ -373,8 +376,10 @@ impl<'a> MoveTestAdapter<'a> for SuiTestAdapter<'a> {
                         let move_struct =
                             MoveStruct::simple_deserialize(move_obj.contents(), &layout).unwrap();
                         self.stabilize_str(format!(
-                            "Owner: {}\nContents: {}",
-                            &obj.owner, move_struct
+                            "Owner: {}\nVersion: {}\nContents: {}",
+                            &obj.owner,
+                            obj.version().value(),
+                            move_struct
                         ))
                     }
                     object::Data::Package(package) => {
@@ -470,9 +475,10 @@ impl<'a> SuiTestAdapter<'a> {
         let input_objects = InputObjects::new(objects_by_kind);
         let transaction_dependencies = input_objects.transaction_dependencies();
         let shared_object_refs: Vec<_> = input_objects.filter_shared_objects();
-        let mut temporary_store =
-            AuthorityTemporaryStore::new(self.storage.clone(), input_objects, transaction_digest);
+        let temporary_store =
+            TemporaryStore::new(self.storage.clone(), input_objects, transaction_digest);
         let (
+            inner,
             TransactionEffects {
                 status,
                 events,
@@ -489,7 +495,7 @@ impl<'a> SuiTestAdapter<'a> {
             execution_error,
         ) = execution_engine::execute_transaction_to_effects(
             shared_object_refs,
-            &mut temporary_store,
+            temporary_store,
             transaction.data,
             transaction_digest,
             transaction_dependencies,
@@ -499,7 +505,9 @@ impl<'a> SuiTestAdapter<'a> {
             // TODO: Support different epochs in transactional tests.
             0,
         );
-        let (_objects, _active_inputs, written, deleted, _events) = temporary_store.into_inner();
+        let InnerTemporaryStore {
+            written, deleted, ..
+        } = inner;
         let created_set: BTreeSet<_> = created.iter().map(|((id, _, _), _)| *id).collect();
         let mut created_ids: Vec<_> = created_set.iter().copied().collect();
         let mut written_ids: Vec<_> = written

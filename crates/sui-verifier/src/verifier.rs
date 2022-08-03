@@ -7,7 +7,7 @@ use move_binary_format::file_format::CompiledModule;
 use sui_types::error::ExecutionError;
 
 use crate::{
-    entry_points_verifier, global_storage_access_verifier, id_immutable_verifier, id_leak_verifier,
+    char_type_verifier, entry_points_verifier, global_storage_access_verifier, id_leak_verifier,
     private_generics, struct_with_key_verifier,
 };
 
@@ -15,8 +15,8 @@ use crate::{
 pub fn verify_module(module: &CompiledModule) -> Result<(), ExecutionError> {
     struct_with_key_verifier::verify_module(module)?;
     global_storage_access_verifier::verify_module(module)?;
-    id_immutable_verifier::verify_module(module)?;
     id_leak_verifier::verify_module(module)?;
     private_generics::verify_module(module)?;
-    entry_points_verifier::verify_module(module)
+    entry_points_verifier::verify_module(module)?;
+    char_type_verifier::verify_module(module)
 }

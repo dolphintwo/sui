@@ -26,8 +26,8 @@ module sui::validator_set_tests {
 
         // Create a validator set with only the first validator in it.
         let validator_set = validator_set::new(vector[validator1]);
-        assert!(validator_set::total_validator_candidate_count(&validator_set) == 1, 0);
-        assert!(validator_set::validator_stake(&validator_set) == 100, 0);
+        assert!(validator_set::next_epoch_validator_count(&validator_set) == 1, 0);
+        assert!(validator_set::total_validator_stake(&validator_set) == 100, 0);
 
         // Add the other 3 validators one by one.
         validator_set::request_add_validator(
@@ -35,8 +35,8 @@ module sui::validator_set_tests {
             validator2,
         );
         // Adding validator during the epoch should not affect stake and quorum threshold.
-        assert!(validator_set::total_validator_candidate_count(&validator_set) == 2, 0);
-        assert!(validator_set::validator_stake(&validator_set) == 100, 0);
+        assert!(validator_set::next_epoch_validator_count(&validator_set) == 2, 0);
+        assert!(validator_set::total_validator_stake(&validator_set) == 100, 0);
 
         validator_set::request_add_validator(
             &mut validator_set,
@@ -54,7 +54,7 @@ module sui::validator_set_tests {
             );
             // Adding stake to existing active validator during the epoch
             // should not change total stake.
-            assert!(validator_set::validator_stake(&validator_set) == 100, 0);
+            assert!(validator_set::total_validator_stake(&validator_set) == 100, 0);
         };
 
         test_scenario::next_tx(&mut scenario, &@0x1);
@@ -69,7 +69,7 @@ module sui::validator_set_tests {
                 ctx1,
             );
             test_scenario::return_owned(&mut scenario, stake1);
-            assert!(validator_set::validator_stake(&validator_set) == 100, 0);
+            assert!(validator_set::total_validator_stake(&validator_set) == 100, 0);
 
             validator_set::request_add_validator(
                 &mut validator_set,
@@ -83,19 +83,19 @@ module sui::validator_set_tests {
             let ctx1 = test_scenario::ctx(&mut scenario);
             validator_set::advance_epoch(&mut validator_set, &mut reward, ctx1);
             // The total stake and quorum should reflect 4 validators.
-            assert!(validator_set::total_validator_candidate_count(&validator_set) == 4, 0);
-            assert!(validator_set::validator_stake(&validator_set) == 1000, 0);
+            assert!(validator_set::next_epoch_validator_count(&validator_set) == 4, 0);
+            assert!(validator_set::total_validator_stake(&validator_set) == 1000, 0);
 
             validator_set::request_remove_validator(
                 &mut validator_set,
                 ctx1,
             );
             // Total validator candidate count changes, but total stake remains during epoch.
-            assert!(validator_set::total_validator_candidate_count(&validator_set) == 3, 0);
-            assert!(validator_set::validator_stake(&validator_set) == 1000, 0);
+            assert!(validator_set::next_epoch_validator_count(&validator_set) == 3, 0);
+            assert!(validator_set::total_validator_stake(&validator_set) == 1000, 0);
             validator_set::advance_epoch(&mut validator_set, &mut reward, ctx1);
             // Validator1 is gone.
-            assert!(validator_set::validator_stake(&validator_set) == 900, 0);
+            assert!(validator_set::total_validator_stake(&validator_set) == 900, 0);
             balance::destroy_zero(reward);
         };
 

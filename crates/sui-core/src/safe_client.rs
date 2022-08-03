@@ -5,10 +5,10 @@
 use crate::authority_client::{AuthorityAPI, BatchInfoResponseItemStream};
 use futures::StreamExt;
 use sui_types::batch::{AuthorityBatch, SignedBatch, TxSequenceNumber, UpdateItem};
-use sui_types::crypto::PublicKeyBytes;
+use sui_types::crypto::AuthorityPublicKeyBytes;
 use sui_types::messages_checkpoint::{
-    AuthenticatedCheckpoint, AuthorityCheckpointInfo, CheckpointRequest, CheckpointRequestType,
-    CheckpointResponse, CheckpointSequenceNumber,
+    AuthenticatedCheckpoint, AuthorityCheckpointInfo, CheckpointContents, CheckpointRequest,
+    CheckpointRequestType, CheckpointResponse, CheckpointSequenceNumber,
 };
 use sui_types::{base_types::*, committee::*, fp_ensure};
 use sui_types::{
@@ -21,11 +21,15 @@ use tracing::info;
 pub struct SafeClient<C> {
     authority_client: C,
     committee: Committee,
-    address: PublicKeyBytes,
+    address: AuthorityPublicKeyBytes,
 }
 
 impl<C> SafeClient<C> {
-    pub fn new(authority_client: C, committee: Committee, address: PublicKeyBytes) -> Self {
+    pub fn new(
+        authority_client: C,
+        committee: Committee,
+        address: AuthorityPublicKeyBytes,
+    ) -> Self {
         Self {
             authority_client,
             committee,
@@ -45,8 +49,8 @@ impl<C> SafeClient<C> {
     // Here we centralize all checks for transaction info responses
     fn check_transaction_response(
         &self,
-        digest: TransactionDigest,
-        effects_digest: Option<TransactionEffectsDigest>,
+        digest: &TransactionDigest,
+        effects_digest: Option<&TransactionEffectsDigest>,
         response: &TransactionInfoResponse,
     ) -> SuiResult {
         if let Some(signed_transaction) = &response.signed_transaction {
@@ -56,14 +60,16 @@ impl<C> SafeClient<C> {
             fp_ensure!(
                 signed_transaction.auth_sign_info.authority == self.address,
                 SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
+                    authority: self.address,
+                    reason: "Unexpected validator address in the signed tx signature".to_string()
                 }
             );
             // Check it's the right transaction
             fp_ensure!(
-                signed_transaction.digest() == &digest,
+                signed_transaction.digest() == digest,
                 SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
+                    authority: self.address,
+                    reason: "Unexpected digest in the signed tx".to_string()
                 }
             );
         }
@@ -73,42 +79,44 @@ impl<C> SafeClient<C> {
             certificate.verify(&self.committee)?;
             // Check it's the right transaction
             fp_ensure!(
-                certificate.digest() == &digest,
+                certificate.digest() == digest,
                 SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
+                    authority: self.address,
+                    reason: "Unexpected digest in the certified tx".to_string()
                 }
             );
         }
 
         if let Some(signed_effects) = &response.signed_effects {
             // Check signature
-            signed_effects
-                .auth_signature
-                .signature
-                .verify(&signed_effects.effects, self.address)?;
+            signed_effects.verify(&self.committee)?;
+            // Check it has the right signer
+            fp_ensure!(
+                signed_effects.auth_signature.authority == self.address,
+                SuiError::ByzantineAuthoritySuspicion {
+                    authority: self.address,
+                    reason: "Unexpected validator address in the signed effects signature"
+                        .to_string()
+                }
+            );
             // Checks it concerns the right tx
             fp_ensure!(
-                signed_effects.effects.transaction_digest == digest,
+                signed_effects.effects.transaction_digest == *digest,
                 SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
+                    authority: self.address,
+                    reason: "Unexpected tx digest in the signed effects".to_string()
                 }
             );
             // check that the effects digest is correct.
             if let Some(effects_digest) = effects_digest {
                 fp_ensure!(
-                    signed_effects.digest() == effects_digest.0,
+                    signed_effects.digest() == effects_digest,
                     SuiError::ByzantineAuthoritySuspicion {
-                        authority: self.address
+                        authority: self.address,
+                        reason: "Effects digest does not match with expected digest".to_string()
                     }
                 );
             }
-            // Check it has the right signer
-            fp_ensure!(
-                signed_effects.auth_signature.authority == self.address,
-                SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
-                }
-            );
         }
 
         Ok(())
@@ -129,7 +137,8 @@ impl<C> SafeClient<C> {
             fp_ensure!(
                 object_id == &request.object_id,
                 SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
+                    authority: self.address,
+                    reason: "Object ID mismatch".to_string()
                 }
             );
             if let ObjectInfoRequestKind::PastObjectInfo(requested_version) = &request.request_kind
@@ -137,7 +146,8 @@ impl<C> SafeClient<C> {
                 fp_ensure!(
                     version == requested_version,
                     SuiError::ByzantineAuthoritySuspicion {
-                        authority: self.address
+                        authority: self.address,
+                        reason: "Object version mismatch".to_string()
                     }
                 );
             }
@@ -151,7 +161,10 @@ impl<C> SafeClient<C> {
                     ObjectInfoRequestKind::LatestObjectInfo(_)
                 ),
                 SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
+                    authority: self.address,
+                    reason:
+                        "Object and lock data returned when request kind is not LatestObjectInfo"
+                            .to_string()
                 }
             );
 
@@ -162,7 +175,9 @@ impl<C> SafeClient<C> {
                     fp_ensure!(
                         object_and_lock.object.compute_object_reference() == obj_ref,
                         SuiError::ByzantineAuthoritySuspicion {
-                            authority: self.address
+                            authority: self.address,
+                            reason: "Requested object reference mismatch with returned object"
+                                .to_string()
                         }
                     );
                 }
@@ -172,6 +187,8 @@ impl<C> SafeClient<C> {
                     // Otherwise the authority has inconsistent data.
                     return Err(SuiError::ByzantineAuthoritySuspicion {
                         authority: self.address,
+                        reason: "Object returned without the object reference in response"
+                            .to_string(),
                     });
                 }
             };
@@ -182,7 +199,9 @@ impl<C> SafeClient<C> {
                 fp_ensure!(
                     signed_transaction.auth_sign_info.authority == self.address,
                     SuiError::ByzantineAuthoritySuspicion {
-                        authority: self.address
+                        authority: self.address,
+                        reason: "Unexpected validator address in the signed tx signature"
+                            .to_string()
                     }
                 );
             }
@@ -201,9 +220,7 @@ impl<C> SafeClient<C> {
         )>,
     ) -> SuiResult {
         // check the signature of the batch
-        signed_batch
-            .signature
-            .verify(&signed_batch.batch, signed_batch.authority)?;
+        signed_batch.verify(&self.committee)?;
 
         // ensure transactions enclosed match requested range
 
@@ -236,7 +253,8 @@ impl<C> SafeClient<C> {
             fp_ensure!(
                 reconstructed_batch == signed_batch.batch,
                 SuiError::ByzantineAuthoritySuspicion {
-                    authority: self.address
+                    authority: self.address,
+                    reason: "Inconsistent batch".to_string()
                 }
             );
         }
@@ -246,7 +264,7 @@ impl<C> SafeClient<C> {
 
     /// This function is used by the higher level authority logic to report an
     /// error that could be due to this authority.
-    pub fn report_client_error(&self, error: SuiError) {
+    pub fn report_client_error(&self, error: &SuiError) {
         info!(?error, authority =? self.address, "Client error");
     }
 }
@@ -302,39 +320,45 @@ where
             .authority_client
             .handle_transaction(transaction)
             .await?;
-        if let Err(err) = self.check_transaction_response(digest, None, &transaction_info) {
-            self.report_client_error(err.clone());
+        if let Err(err) = self.check_transaction_response(&digest, None, &transaction_info) {
+            self.report_client_error(&err);
             return Err(err);
         }
         Ok(transaction_info)
     }
 
-    /// Confirm a transfer to a Sui or Primary account.
-    pub async fn handle_confirmation_transaction(
+    fn verify_certificate_response(
         &self,
-        transaction: ConfirmationTransaction,
+        digest: &TransactionDigest,
+        response: &TransactionInfoResponse,
+    ) -> SuiResult {
+        fp_ensure!(
+            response.signed_effects.is_some(),
+            SuiError::ByzantineAuthoritySuspicion {
+                authority: self.address,
+                reason: "An Ok response from handle_certificate must contain signed effects"
+                    .to_string()
+            }
+        );
+        self.check_transaction_response(digest, None, response)
+    }
+
+    /// Execute a certificate.
+    pub async fn handle_certificate(
+        &self,
+        certificate: CertifiedTransaction,
     ) -> Result<TransactionInfoResponse, SuiError> {
-        let digest = *transaction.certificate.digest();
+        let digest = *certificate.digest();
         let transaction_info = self
             .authority_client
-            .handle_confirmation_transaction(transaction)
+            .handle_certificate(certificate)
             .await?;
 
-        if let Err(err) = self.check_transaction_response(digest, None, &transaction_info) {
-            self.report_client_error(err.clone());
+        if let Err(err) = self.verify_certificate_response(&digest, &transaction_info) {
+            self.report_client_error(&err);
             return Err(err);
         }
         Ok(transaction_info)
-    }
-
-    pub async fn handle_consensus_transaction(
-        &self,
-        transaction: ConsensusTransaction,
-    ) -> Result<TransactionInfoResponse, SuiError> {
-        // TODO: Add safety checks on the response.
-        self.authority_client
-            .handle_consensus_transaction(transaction)
-            .await
     }
 
     pub async fn handle_account_info_request(
@@ -355,7 +379,7 @@ where
             .handle_object_info_request(request.clone())
             .await?;
         if let Err(err) = self.check_object_response(&request, &response) {
-            self.report_client_error(err.clone());
+            self.report_client_error(&err);
             return Err(err);
         }
         Ok(response)
@@ -372,8 +396,8 @@ where
             .handle_transaction_info_request(request)
             .await?;
 
-        if let Err(err) = self.check_transaction_response(digest, None, &transaction_info) {
-            self.report_client_error(err.clone());
+        if let Err(err) = self.check_transaction_response(&digest, None, &transaction_info) {
+            self.report_client_error(&err);
             return Err(err);
         }
         Ok(transaction_info)
@@ -384,54 +408,91 @@ where
         &self,
         digests: &ExecutionDigests,
     ) -> Result<TransactionInfoResponse, SuiError> {
-        let digest = digests.transaction;
-        let effects_digest = digests.effects;
-
         let transaction_info = self
             .authority_client
-            .handle_transaction_info_request(digest.into())
+            .handle_transaction_info_request(digests.transaction.into())
             .await?;
 
-        if let Err(err) =
-            self.check_transaction_response(digest, Some(effects_digest), &transaction_info)
-        {
-            self.report_client_error(err.clone());
+        if let Err(err) = self.check_transaction_response(
+            &digests.transaction,
+            Some(&digests.effects),
+            &transaction_info,
+        ) {
+            self.report_client_error(&err);
             return Err(err);
         }
         Ok(transaction_info)
     }
 
-    fn verify_authenticated_checkpoint(
+    fn verify_checkpoint_sequence(
         &self,
         expected_seq: Option<CheckpointSequenceNumber>,
-        checkpoint: &AuthenticatedCheckpoint,
+        checkpoint: &Option<AuthenticatedCheckpoint>,
     ) -> SuiResult {
-        let observed_seq = match checkpoint {
-            AuthenticatedCheckpoint::None => None,
-            AuthenticatedCheckpoint::Signed(s) => {
-                s.verify()?;
-                Some(*s.summary.sequence_number())
-            }
-            AuthenticatedCheckpoint::Certified(c) => {
-                c.verify(&self.committee)?;
-                Some(*c.summary.sequence_number())
-            }
-        };
+        let observed_seq = checkpoint.as_ref().map(|c| c.summary().sequence_number);
 
-        match (expected_seq, observed_seq) {
-            (Some(e), Some(o)) => {
-                fp_ensure!(
-                    e == o,
-                    SuiError::ByzantineAuthoritySuspicion {
-                        authority: self.address,
-                    }
-                );
-                Ok(())
+        if let (Some(e), Some(o)) = (expected_seq, observed_seq) {
+            fp_ensure!(
+                e == o,
+                SuiError::from("Expected checkpoint number doesn't match with returned")
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_contents_exist<T>(
+        &self,
+        request_content: bool,
+        checkpoint: &Option<T>,
+        contents: &Option<CheckpointContents>,
+    ) -> SuiResult {
+        match (request_content, checkpoint, contents) {
+            // If content is requested, checkpoint is not None, but we are not getting any content,
+            // it's an error.
+            // If content is not requested, or checkpoint is None, yet we are still getting content,
+            // it's an error.
+            (true, Some(_), None) | (false, _, Some(_)) | (_, None, Some(_)) => Err(
+                SuiError::from("Checkpoint contents inconsistent with request"),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    fn verify_checkpoint_response(
+        &self,
+        request: &CheckpointRequest,
+        response: &CheckpointResponse,
+    ) -> SuiResult {
+        // Verify signatures
+        response.verify(&self.committee)?;
+
+        // Verify response data was correct for request
+        match &request.request_type {
+            CheckpointRequestType::AuthenticatedCheckpoint(seq) => {
+                if let AuthorityCheckpointInfo::AuthenticatedCheckpoint(checkpoint) = &response.info
+                {
+                    // Checks that the sequence number is correct.
+                    self.verify_checkpoint_sequence(*seq, checkpoint)?;
+                    self.verify_contents_exist(request.detail, checkpoint, &response.detail)
+                } else {
+                    Err(SuiError::from(
+                        "Invalid AuthorityCheckpointInfo type in the response",
+                    ))
+                }
             }
-            (None, _) => Ok(()),
-            _ => Err(SuiError::ByzantineAuthoritySuspicion {
-                authority: self.address,
-            }),
+            CheckpointRequestType::CheckpointProposal => {
+                if let AuthorityCheckpointInfo::CheckpointProposal {
+                    proposal,
+                    prev_cert: _,
+                } = &response.info
+                {
+                    self.verify_contents_exist(request.detail, proposal, &response.detail)
+                } else {
+                    Err(SuiError::from(
+                        "Invalid AuthorityCheckpointInfo type in the response",
+                    ))
+                }
+            }
         }
     }
 
@@ -439,35 +500,16 @@ where
         &self,
         request: CheckpointRequest,
     ) -> Result<CheckpointResponse, SuiError> {
-        let req_type = request.request_type.clone();
-
-        let resp = self.authority_client.handle_checkpoint(request).await?;
-
-        match req_type {
-            CheckpointRequestType::LatestCheckpointProposal => {
-                if let AuthorityCheckpointInfo::Proposal { current, previous } = &resp.info {
-                    if let Some(current) = current {
-                        current.verify()?;
-                    }
-                    self.verify_authenticated_checkpoint(None, previous)?;
-                    Ok(resp)
-                } else {
-                    Err(SuiError::ByzantineAuthoritySuspicion {
-                        authority: self.address,
-                    })
-                }
-            }
-            CheckpointRequestType::PastCheckpoint(seq) => {
-                if let AuthorityCheckpointInfo::Past(past) = &resp.info {
-                    self.verify_authenticated_checkpoint(Some(seq), past)?;
-                    Ok(resp)
-                } else {
-                    Err(SuiError::ByzantineAuthoritySuspicion {
-                        authority: self.address,
-                    })
-                }
-            }
-        }
+        let resp = self
+            .authority_client
+            .handle_checkpoint(request.clone())
+            .await?;
+        self.verify_checkpoint_response(&request, &resp)
+            .map_err(|err| {
+                self.report_client_error(&err);
+                err
+            })?;
+        Ok(resp)
     }
 
     /// Handle Batch information requests for this authority.
@@ -502,7 +544,7 @@ where
                             signed_batch,
                             txs_and_last_batch,
                         ) {
-                            client.report_client_error(err.clone());
+                            client.report_client_error(&err);
                             Some(Err(err))
                         } else {
                             // Insert a fresh vector for the new batch of transactions
@@ -516,9 +558,11 @@ where
                         // And here we insert the tuple into the batch.
                         match txs_and_last_batch {
                             None => {
-                                let err =
-                                    SuiError::ByzantineAuthoritySuspicion { authority: address };
-                                client.report_client_error(err.clone());
+                                let err = SuiError::ByzantineAuthoritySuspicion {
+                                    authority: address,
+                                    reason: "Stream does not start with a batch".to_string(),
+                                };
+                                client.report_client_error(&err);
                                 Some(Err(err))
                             }
                             Some(txs) => {

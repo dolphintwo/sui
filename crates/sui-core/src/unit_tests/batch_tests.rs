@@ -1,11 +1,14 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use narwhal_crypto::traits::KeyPair;
 use rand::{prelude::StdRng, SeedableRng};
 use sui_types::committee::Committee;
 use sui_types::crypto::get_key_pair;
 use sui_types::crypto::get_key_pair_from_rng;
-use sui_types::crypto::KeyPair;
+use sui_types::crypto::AccountKeyPair;
+use sui_types::crypto::AuthorityKeyPair;
+use sui_types::crypto::AuthorityPublicKeyBytes;
 use sui_types::messages_checkpoint::CheckpointRequest;
 use sui_types::messages_checkpoint::CheckpointResponse;
 
@@ -24,19 +27,21 @@ use std::fs;
 use std::sync::Arc;
 use sui_types::messages::{
     AccountInfoRequest, AccountInfoResponse, BatchInfoRequest, BatchInfoResponseItem,
-    ConfirmationTransaction, ConsensusTransaction, ObjectInfoRequest, ObjectInfoResponse,
-    Transaction, TransactionInfoRequest, TransactionInfoResponse,
+    CertifiedTransaction, ObjectInfoRequest, ObjectInfoResponse, Transaction,
+    TransactionInfoRequest, TransactionInfoResponse,
 };
 use sui_types::object::Object;
 
-pub(crate) fn init_state_parameters_from_rng<R>(rng: &mut R) -> (Committee, SuiAddress, KeyPair)
+pub(crate) fn init_state_parameters_from_rng<R>(
+    rng: &mut R,
+) -> (Committee, SuiAddress, AuthorityKeyPair)
 where
     R: rand::CryptoRng + rand::RngCore,
 {
-    let (authority_address, authority_key) = get_key_pair_from_rng(rng);
-    let mut authorities = BTreeMap::new();
+    let (authority_address, authority_key): (_, AuthorityKeyPair) = get_key_pair_from_rng(rng);
+    let mut authorities: BTreeMap<AuthorityPublicKeyBytes, u64> = BTreeMap::new();
     authorities.insert(
-        /* address */ *authority_key.public_key_bytes(),
+        /* address */ authority_key.public().into(),
         /* voting right */ 1,
     );
     let committee = Committee::new(0, authorities).unwrap();
@@ -46,12 +51,12 @@ where
 
 pub(crate) async fn init_state(
     committee: Committee,
-    authority_key: KeyPair,
+    authority_key: AuthorityKeyPair,
     store: Arc<AuthorityStore>,
 ) -> AuthorityState {
     AuthorityState::new(
         committee,
-        *authority_key.public_key_bytes(),
+        authority_key.public().into(),
         Arc::pin(authority_key),
         store,
         None,
@@ -92,6 +97,7 @@ async fn test_open_manager() {
         //         when we re-open the database.
 
         store
+            .tables
             .executed_sequence
             .insert(&0, &ExecutionDigests::random())
             .expect("no error on write");
@@ -114,6 +120,7 @@ async fn test_open_manager() {
 
         // TEST 3: If the database contains out of order transactions we just make a block with gaps
         store
+            .tables
             .executed_sequence
             .insert(&2, &ExecutionDigests::random())
             .expect("no error on write");
@@ -339,7 +346,7 @@ async fn test_batch_manager_drop_out_of_order() {
 
 #[tokio::test]
 async fn test_handle_move_order_with_batch() {
-    let (sender, sender_key) = get_key_pair();
+    let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
     let gas_payment_object_id = ObjectID::random();
     let gas_payment_object = Object::with_id_owner_for_testing(gas_payment_object_id, sender);
     let authority_state = Arc::new(init_state_with_objects(vec![gas_payment_object]).await);
@@ -407,6 +414,7 @@ async fn test_batch_store_retrieval() {
     for _i in 0u64..105 {
         let t0 = &authority_state.batch_notifier.ticket().expect("ok");
         inner_store
+            .tables
             .executed_sequence
             .insert(&t0.seq(), &tx_zero)
             .expect("Failed to write.");
@@ -421,6 +429,7 @@ async fn test_batch_store_retrieval() {
     for _i in 110u64..120 {
         let t0 = &authority_state.batch_notifier.ticket().expect("ok");
         inner_store
+            .tables
             .executed_sequence
             .insert(&t0.seq(), &tx_zero)
             .expect("Failed to write.");
@@ -505,20 +514,9 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
         })
     }
 
-    async fn handle_confirmation_transaction(
+    async fn handle_certificate(
         &self,
-        _transaction: ConfirmationTransaction,
-    ) -> Result<TransactionInfoResponse, SuiError> {
-        Ok(TransactionInfoResponse {
-            signed_transaction: None,
-            certified_transaction: None,
-            signed_effects: None,
-        })
-    }
-
-    async fn handle_consensus_transaction(
-        &self,
-        _transaction: ConsensusTransaction,
+        _certificate: CertifiedTransaction,
     ) -> Result<TransactionInfoResponse, SuiError> {
         Ok(TransactionInfoResponse {
             signed_transaction: None,
@@ -579,7 +577,7 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
         let mut items = Vec::new();
         let mut last_batch = AuthorityBatch::initial();
         items.push({
-            let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+            let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
             BatchInfoResponseItem(UpdateItem::Batch(item))
         });
         let mut seq = 0;
@@ -595,7 +593,7 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
             let new_batch = AuthorityBatch::make_next(&last_batch, &transactions).unwrap();
             last_batch = new_batch;
             items.push({
-                let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+                let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
                 BatchInfoResponseItem(UpdateItem::Batch(item))
             });
         }
@@ -631,20 +629,9 @@ impl AuthorityAPI for ByzantineAuthorityClient {
         })
     }
 
-    async fn handle_confirmation_transaction(
+    async fn handle_certificate(
         &self,
-        _transaction: ConfirmationTransaction,
-    ) -> Result<TransactionInfoResponse, SuiError> {
-        Ok(TransactionInfoResponse {
-            signed_transaction: None,
-            certified_transaction: None,
-            signed_effects: None,
-        })
-    }
-
-    async fn handle_consensus_transaction(
-        &self,
-        _transaction: ConsensusTransaction,
+        _certificate: CertifiedTransaction,
     ) -> Result<TransactionInfoResponse, SuiError> {
         Ok(TransactionInfoResponse {
             signed_transaction: None,
@@ -706,7 +693,7 @@ impl AuthorityAPI for ByzantineAuthorityClient {
         let mut items = Vec::new();
         let mut last_batch = AuthorityBatch::initial();
         items.push({
-            let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+            let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
             BatchInfoResponseItem(UpdateItem::Batch(item))
         });
         let mut seq = 0;
@@ -728,7 +715,7 @@ impl AuthorityAPI for ByzantineAuthorityClient {
             let new_batch = AuthorityBatch::make_next(&last_batch, &transactions).unwrap();
             last_batch = new_batch;
             items.push({
-                let item = SignedBatch::new(last_batch.clone(), &*secret, name);
+                let item = SignedBatch::new_with_zero_epoch(last_batch.clone(), &*secret, name);
                 BatchInfoResponseItem(UpdateItem::Batch(item))
             });
         }
@@ -755,9 +742,9 @@ async fn test_safe_batch_stream() {
     let path = dir.join(format!("DB_{:?}", ObjectID::random()));
     fs::create_dir(&path).unwrap();
 
-    let (_, authority_key) = get_key_pair();
-    let mut authorities = BTreeMap::new();
-    let public_key_bytes = *authority_key.public_key_bytes();
+    let (_, authority_key): (_, AuthorityKeyPair) = get_key_pair();
+    let mut authorities: BTreeMap<AuthorityPublicKeyBytes, u64> = BTreeMap::new();
+    let public_key_bytes = authority_key.public().into();
     println!("init public key {:?}", public_key_bytes);
 
     authorities.insert(public_key_bytes, 1);
@@ -809,8 +796,8 @@ async fn test_safe_batch_stream() {
     assert!(!error_found);
 
     // Byzantine cases:
-    let (_, authority_key) = get_key_pair();
-    let public_key_bytes_b = *authority_key.public_key_bytes();
+    let (_, authority_key): (_, AuthorityKeyPair) = get_key_pair();
+    let public_key_bytes_b = authority_key.public().into();
     let state_b = AuthorityState::new(
         committee.clone(),
         public_key_bytes_b,

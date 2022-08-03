@@ -15,7 +15,7 @@ use crate::{
     base_types::{ObjectID, SequenceNumber},
     coin::Coin,
     error::{ExecutionError, ExecutionErrorKind},
-    id::VersionedID,
+    id::UID,
     object::{Data, MoveObject, Object},
     SUI_FRAMEWORK_ADDRESS,
 };
@@ -44,8 +44,8 @@ impl GAS {
 pub struct GasCoin(pub Coin);
 
 impl GasCoin {
-    pub fn new(id: ObjectID, version: SequenceNumber, value: u64) -> Self {
-        Self(Coin::new(VersionedID::new(id, version), value))
+    pub fn new(id: ObjectID, value: u64) -> Self {
+        Self(Coin::new(UID::new(id), value))
     }
 
     pub fn value(&self) -> u64 {
@@ -60,35 +60,32 @@ impl GasCoin {
         self.0.id()
     }
 
-    pub fn version(&self) -> SequenceNumber {
-        self.0.version()
-    }
-
     pub fn to_bcs_bytes(&self) -> Vec<u8> {
         bcs::to_bytes(&self).unwrap()
     }
 
-    pub fn to_object(&self) -> MoveObject {
-        MoveObject::new_gas_coin(self.to_bcs_bytes())
+    pub fn to_object(&self, version: SequenceNumber) -> MoveObject {
+        MoveObject::new_gas_coin(version, self.to_bcs_bytes())
     }
 
     pub fn layout() -> MoveStructLayout {
         Coin::layout(Self::type_())
     }
 }
+
 impl TryFrom<&MoveObject> for GasCoin {
     type Error = ExecutionError;
 
     fn try_from(value: &MoveObject) -> Result<GasCoin, ExecutionError> {
         if value.type_ != GasCoin::type_() {
             return Err(ExecutionError::new_with_source(
-                ExecutionErrorKind::TypeError,
+                ExecutionErrorKind::InvalidGasObject,
                 format!("Gas object type is not a gas coin: {}", value.type_),
             ));
         }
         let gas_coin: GasCoin = bcs::from_bytes(value.contents()).map_err(|err| {
             ExecutionError::new_with_source(
-                ExecutionErrorKind::TypeError,
+                ExecutionErrorKind::InvalidGasObject,
                 format!("Unable to deserialize gas object: {:?}", err),
             )
         })?;
@@ -103,7 +100,7 @@ impl TryFrom<&Object> for GasCoin {
         match &value.data {
             Data::Move(obj) => obj.try_into(),
             Data::Package(_) => Err(ExecutionError::new_with_source(
-                ExecutionErrorKind::TypeError,
+                ExecutionErrorKind::InvalidGasObject,
                 format!("Gas object type is not a gas coin: {:?}", value),
             )),
         }

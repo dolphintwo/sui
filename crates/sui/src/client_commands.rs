@@ -16,19 +16,17 @@ use move_core_types::{language_storage::TypeTag, parser::parse_type_tag};
 use move_package::BuildConfig;
 use serde::Serialize;
 use serde_json::json;
-use sui_json_rpc_api::rpc_types::{
+use sui_json_rpc_types::{
     GetObjectDataResponse, MergeCoinResponse, PublishResponse, SplitCoinResponse, SuiObjectInfo,
     SuiParsedObject,
 };
 use tracing::info;
 
-use sui_core::gateway_state::GatewayClient;
 use sui_framework::build_move_package_to_bytes;
 use sui_json::SuiJsonValue;
-use sui_json_rpc_api::keystore::Keystore;
-use sui_json_rpc_api::rpc_types::{
-    SuiCertifiedTransaction, SuiExecutionStatus, SuiTransactionEffects,
-};
+use sui_json_rpc_types::{SuiCertifiedTransaction, SuiExecutionStatus, SuiTransactionEffects};
+use sui_sdk::crypto::Keystore;
+use sui_sdk::{ClientType, SuiClient};
 use sui_types::object::Owner;
 use sui_types::sui_serde::{Base64, Encoding};
 use sui_types::{
@@ -38,7 +36,7 @@ use sui_types::{
     SUI_FRAMEWORK_ADDRESS,
 };
 
-use crate::config::{Config, GatewayType, PersistedConfig, SuiClientConfig};
+use crate::config::{Config, PersistedConfig, SuiClientConfig};
 
 pub const EXAMPLE_NFT_NAME: &str = "Example NFT";
 pub const EXAMPLE_NFT_DESCRIPTION: &str = "An NFT created by the Sui Command Line Tool";
@@ -333,7 +331,7 @@ impl SuiClientCommands {
 
                 let data = context
                     .gateway
-                    .public_transfer_object(from, object_id, gas, gas_budget, to)
+                    .transfer_object(from, object_id, gas, gas_budget, to)
                     .await?;
                 let signature = context.keystore.sign(&from, &data.to_bytes())?;
                 let response = context
@@ -469,7 +467,7 @@ impl SuiClientCommands {
 
                 if let Some(gateway) = &gateway {
                     // TODO: handle embedded gateway
-                    context.config.gateway = GatewayType::RPC(gateway.clone());
+                    context.config.gateway = ClientType::RPC(gateway.clone());
                     context.config.save()?;
                 }
 
@@ -528,11 +526,11 @@ impl SuiClientCommands {
 pub struct WalletContext {
     pub config: PersistedConfig<SuiClientConfig>,
     pub keystore: Box<dyn Keystore>,
-    pub gateway: GatewayClient,
+    pub gateway: SuiClient,
 }
 
 impl WalletContext {
-    pub fn new(config_path: &Path) -> Result<Self, anyhow::Error> {
+    pub async fn new(config_path: &Path) -> Result<Self, anyhow::Error> {
         let config: SuiClientConfig = PersistedConfig::read(config_path).map_err(|err| {
             err.context(format!(
                 "Cannot open wallet config file at {:?}",
@@ -541,11 +539,11 @@ impl WalletContext {
         })?;
         let config = config.persisted(config_path);
         let keystore = config.keystore.init()?;
-        let gateway = config.gateway.init()?;
+        let client = config.gateway.init().await?;
         let context = Self {
             config,
             keystore,
-            gateway,
+            gateway: client,
         };
         Ok(context)
     }
@@ -687,23 +685,13 @@ impl Display for SuiClientCommandResult {
             }
             SuiClientCommandResult::Gas(gases) => {
                 // TODO: generalize formatting of CLI
-                writeln!(
-                    writer,
-                    " {0: ^42} | {1: ^10} | {2: ^11}",
-                    "Object ID", "Version", "Gas Value"
-                )?;
+                writeln!(writer, " {0: ^42} | {1: ^11}", "Object ID", "Gas Value")?;
                 writeln!(
                     writer,
                     "----------------------------------------------------------------------"
                 )?;
                 for gas in gases {
-                    writeln!(
-                        writer,
-                        " {0: ^42} | {1: ^10} | {2: ^11}",
-                        gas.id(),
-                        u64::from(gas.version()),
-                        gas.value()
-                    )?;
+                    writeln!(writer, " {0: ^42} | {1: ^11}", gas.id(), gas.value())?;
                 }
             }
             SuiClientCommandResult::SplitCoin(response) => {

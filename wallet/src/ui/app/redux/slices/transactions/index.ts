@@ -48,16 +48,69 @@ export const sendTokens = createAsyncThunk<
                     isSuiMoveObject(anObj.data) && anObj.data.type === coinType
             )
             .map(({ data }) => data as SuiMoveObject);
-        const response = await Coin.transferCoin(
-            api.getSignerInstance(keypairVault.getKeyPair()),
-            coins,
-            amount,
-            recipientAddress
-        );
+        const response =
+            Coin.getCoinSymbol(tokenTypeArg) === 'SUI'
+                ? await Coin.transferSui(
+                      api.getSignerInstance(keypairVault.getKeyPair()),
+                      coins,
+                      amount,
+                      recipientAddress
+                  )
+                : await Coin.transferCoin(
+                      api.getSignerInstance(keypairVault.getKeyPair()),
+                      coins,
+                      amount,
+                      recipientAddress
+                  );
 
         // TODO: better way to sync latest objects
         dispatch(fetchAllOwnedObjects());
         // TODO: is this correct? Find a better way to do it
+        return response as TransactionResult;
+    }
+);
+
+type StakeTokensTXArgs = {
+    tokenTypeArg: string;
+    amount: bigint;
+};
+
+export const StakeTokens = createAsyncThunk<
+    TransactionResult,
+    StakeTokensTXArgs,
+    AppThunkConfig
+>(
+    'sui-objects/stake',
+    async (
+        { tokenTypeArg, amount },
+        { getState, extra: { api, keypairVault }, dispatch }
+    ) => {
+        const state = getState();
+        const coinType = Coin.getCoinTypeFromArg(tokenTypeArg);
+
+        const coins: SuiMoveObject[] = suiObjectsAdapterSelectors
+            .selectAll(state)
+            .filter(
+                (anObj) =>
+                    isSuiMoveObject(anObj.data) && anObj.data.type === coinType
+            )
+            .map(({ data }) => data as SuiMoveObject);
+
+        // TODO: fetch the first active validator for now,
+        // repalce it with the user picked one
+        const activeValidators = await Coin.getActiveValidators(
+            api.instance.fullNode
+        );
+        const first_validator = activeValidators[0];
+        const metadata = (first_validator as SuiMoveObject).fields.metadata;
+        const validatorAddress = (metadata as SuiMoveObject).fields.sui_address;
+        const response = await Coin.stakeCoin(
+            api.getSignerInstance(keypairVault.getKeyPair()),
+            coins,
+            amount,
+            validatorAddress
+        );
+        dispatch(fetchAllOwnedObjects());
         return response as TransactionResult;
     }
 );
@@ -76,6 +129,9 @@ const slice = createSlice({
     reducers: {},
     extraReducers: (builder) => {
         builder.addCase(sendTokens.fulfilled, (state, { payload }) => {
+            return txAdapter.setOne(state, payload);
+        });
+        builder.addCase(StakeTokens.fulfilled, (state, { payload }) => {
             return txAdapter.setOne(state, payload);
         });
     },

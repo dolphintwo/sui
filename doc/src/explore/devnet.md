@@ -1,14 +1,14 @@
 ---
-title: Experiment with Sui DevNet
+title: Experiment with Sui Devnet
 ---
 
-Welcome to the beginnings of the Sui DevNet. It exists now to gain operational experience with the Sui software in a public setting. The Sui DevNet currently consists of:
+Welcome to the beginnings of the Sui Devnet. It exists now to gain operational experience with the Sui software in a public setting. The Sui Devnet currently consists of:
 
 * A four-validator network with all nodes operated by Mysten Labs. Clients send transactions and read requests via this endpoint: https://gateway.devnet.sui.io:443/ using [JSON-RPC](../build/json-rpc.md)
-* A public network [Sui Explorer](https://github.com/MystenLabs/sui/tree/main/explorer/client#readme) for browsing the TestNet transaction history: https://explorer.devnet.sui.io
+* A public network [Sui Explorer](https://github.com/MystenLabs/sui/tree/main/explorer/client#readme) for browsing transaction history: https://explorer.devnet.sui.io
 * A [Discord channel](https://discordapp.com/channels/916379725201563759/971488439931392130) for requesting test coins that can be used to pay for gas on the test network. These coins have no financial value and will disappear each time we reset the network.
 
-Many improvements to the Sui DevNet are underway, such as the ability to run full nodes and use a browser-based wallet. See the [Sui DevNet blog post](https://medium.com/mysten-labs/sui-devnet-public-release-a2be304ff36b) announcement for full details on upcoming features. All DevNet usage is subject to our [terms of service](https://sui.io/terms/).
+Many improvements to the Sui Devnet are underway, such as the ability to run full nodes and use a browser-based wallet. See the [Sui Devnet blog post](https://medium.com/mysten-labs/sui-devnet-public-release-a2be304ff36b) announcement for full details on upcoming features. All Devnet usage is subject to our [terms of service](https://sui.io/terms/).
 
 ## Tools
 
@@ -24,7 +24,7 @@ We provide the following tools for users to interact with the Sui Devnet:
 
 ### Set up environment
 
-You may simply [install Sui](../build/install.md) and then request test tokens as described in the install docs. To use the Sui DevNet, you will need:
+You may simply [install Sui](../build/install.md) and then request test tokens as described in the install docs. To use the Sui Devnet, you will need:
 
 1. Sui [test coins (tokens)](#request-gas-tokens) requested through [Discord](https://discordapp.com/channels/916379725201563759/971488439931392130).
 1. the [`git` command line interface](https://git-scm.com/download/).
@@ -37,13 +37,13 @@ $ which sui
 ```
 You should see the path to the command. Otherwise, reinstall.
 
-> **Tip:** To reliably test DevNet with the latest Sui binaries, re-install them at least weekly.
+> **Tip:** To reliably test Devnet with the latest Sui binaries, re-install them at least weekly.
 
 In addition, to conduct advanced work such as publishing a Move module or making a Move call, also obtain the [Sui source code](../build/install.md#source-code); for simplicity, we recommend installing in `~/sui` or using an environment variable.
 
 ### Set up Sui CLI client, connect to gateway
 
-Now [set up your Sui CLI client and connect to DevNet](../build/cli-client.md#connect-to-devnet) in a single step. Note you can [manually change the Gateway URL](../build/cli-client.md#manually-change-the-rpc-server-url) if you have already configured a Sui CLI client.
+Now [set up your Sui CLI client and connect to Devnet](../build/cli-client.md#connect-to-devnet) in a single step. Note you can [manually change the Gateway URL](../build/cli-client.md#manually-change-the-rpc-server-url) if you have already configured a Sui CLI client.
 
 > **Tip:** If you run into issues, reset the Sui configuration by removing its directory, by default located at `~/.sui/sui_config`. Then reinstall [Sui binaries](../build/install.md#binaries).
 
@@ -78,10 +78,8 @@ Type: 0x2::devnet_nft::DevNetNFT
 
 The above command created an object with ID `ED883F6812AF447B9B0CE220DA5EA9E0F58012FE`. Note you may use `Sui CLI client` to [view objects owned by the account](https://docs.sui.io/build/wallet#view-objects-owned-by-the-account).
 
-Now you can view the created object in the [Sui Explorer](https://explorer.devnet.sui.io) at:
-https://explorer.devnet.sui.io/objects/ED883F6812AF447B9B0CE220DA5EA9E0F58012FE
-
-Replace the object ID in the link above with the object ID of the Example NFT you observed in your own command output to see it in Sui Explorer:
+Now you can view the created object in the [Sui Explorer](https://explorer.devnet.sui.io) by appending the object ID to:
+https://explorer.devnet.sui.io/objects/
 
 ![Example NFT](../../static/example-nft.png "Example NFT")
 
@@ -123,7 +121,7 @@ See the [Sui Explorer README](https://github.com/MystenLabs/sui/tree/main/explor
 
 ### Publish a Move module
 
-Publish a sample Move package containing code developed in the [Sui Move tutorial](../build/move.md#writing-a-package) as follows (assuming you installed the source code in `~sui` as advised in set up):
+Publish a sample Move package containing code developed in the [Sui Move tutorial](../build/move/write-package.md) as follows (assuming you installed the source code in `~sui` as advised in set up):
 ```shell
 $ sui client publish --path <your-sui-repo>/sui_programmability/examples/move_tutorial --gas-budget 30000
 ```
@@ -149,7 +147,7 @@ Updated Gas : Coin { id: 58C4DAA98694266F4DF47BA436CD99659B6A5342, value: 49552 
 Two important things happened as a result of publishing this package:
 
 * a package object (with ID `0689E58788C875E9C354F359792CEC016DA0A1B0`)  has been created
-* a `Forge` object (with ID `898922A9CABE93C6C38C55BBE047BFB0A8C864BF`) has been created as a result of running a [module initializer](../build/move.md#module-initializers) for one (and the only one) module of this package
+* a `Forge` object (with ID `898922A9CABE93C6C38C55BBE047BFB0A8C864BF`) has been created as a result of running a [module initializer](../build/move/debug-publish.md#module-initializers) for one (and the only one) module of this package
 
 Specific object IDs displayed above may differ from one Sui installation to the other, so we will use the following placeholders for them (respectively): <PACKAGE_ID> and <FORGE_ID>. Whenever you see these used in the command line, for example when calling Move functions in the next section, *replace them with actual object IDs*.
 
@@ -198,9 +196,9 @@ Mutated Objects:
 
 Go to the Sui Explorer to observe a newly created object (ID `2E34983D59E9FC5310CFBAA953D2188E6A84FD21`, in this example). You should see a sword object created with `Magic` property of `42` and `Strength` property of `7` and transferred to the new owner.
 
-As above, replace object ID in the Explorer link with the object ID of the created object you observed in your own command output:
-https://explorer.devnet.sui.io/objects/OBJECT-ID
+As above, replace the object ID in the Explorer link with the object ID of the created object you observed in your own command output, appended to:
+https://explorer.devnet.sui.io/objects/
 
 ![Magic sword](../../static/magic-sword.png "Magic sword")
 
-This concludes the Sui DevNet setup and testing instructions. Revisit this page and re-install the binaries regularly to witness and help Sui grow!
+This concludes the Sui Devnet setup and testing instructions. Revisit this page and re-install the binaries regularly to witness and help Sui grow!

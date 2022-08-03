@@ -4,8 +4,10 @@
 use move_core_types::ident_str;
 use move_core_types::identifier::Identifier;
 use std::{collections::BTreeSet, sync::Arc};
+use sui_adapter::temporary_store::InnerTemporaryStore;
+use sui_types::storage::ParentSync;
 
-use crate::authority::AuthorityTemporaryStore;
+use crate::authority::TemporaryStore;
 use move_core_types::language_storage::ModuleId;
 use move_vm_runtime::{move_vm::MoveVM, native_functions::NativeFunctionTable};
 use sui_adapter::adapter;
@@ -31,9 +33,9 @@ use sui_types::{
 use tracing::{debug, instrument, trace};
 
 #[instrument(name = "tx_execute_to_effects", level = "debug", skip_all)]
-pub fn execute_transaction_to_effects<S: BackingPackageStore>(
+pub fn execute_transaction_to_effects<S: BackingPackageStore + ParentSync>(
     shared_object_refs: Vec<ObjectRef>,
-    temporary_store: &mut AuthorityTemporaryStore<S>,
+    mut temporary_store: TemporaryStore<S>,
     transaction_data: TransactionData,
     transaction_digest: TransactionDigest,
     mut transaction_dependencies: BTreeSet<TransactionDigest>,
@@ -41,12 +43,16 @@ pub fn execute_transaction_to_effects<S: BackingPackageStore>(
     native_functions: &NativeFunctionTable,
     gas_status: SuiGasStatus,
     epoch: EpochId,
-) -> (TransactionEffects, Option<ExecutionError>) {
+) -> (
+    InnerTemporaryStore,
+    TransactionEffects,
+    Option<ExecutionError>,
+) {
     let mut tx_ctx = TxContext::new(&transaction_data.signer(), &transaction_digest, epoch);
 
     let gas_object_ref = *transaction_data.gas_payment_object_ref();
     let (gas_cost_summary, execution_result) = execute_transaction(
-        temporary_store,
+        &mut temporary_store,
         transaction_data,
         gas_object_ref.0,
         &mut tx_ctx,
@@ -73,7 +79,7 @@ pub fn execute_transaction_to_effects<S: BackingPackageStore>(
     // Remove from dependencies the generic hash
     transaction_dependencies.remove(&TransactionDigest::genesis());
 
-    let effects = temporary_store.to_effects(
+    let (inner, effects) = temporary_store.to_effects(
         shared_object_refs,
         &transaction_digest,
         transaction_dependencies.into_iter().collect(),
@@ -81,11 +87,11 @@ pub fn execute_transaction_to_effects<S: BackingPackageStore>(
         status,
         gas_object_ref,
     );
-    (effects, execution_error)
+    (inner, effects, execution_error)
 }
 
 fn charge_gas_for_object_read<S>(
-    temporary_store: &AuthorityTemporaryStore<S>,
+    temporary_store: &TemporaryStore<S>,
     gas_status: &mut SuiGasStatus,
 ) -> Result<(), ExecutionError> {
     // Charge gas for reading all objects from the DB.
@@ -100,8 +106,8 @@ fn charge_gas_for_object_read<S>(
 }
 
 #[instrument(name = "tx_execute", level = "debug", skip_all)]
-fn execute_transaction<S: BackingPackageStore>(
-    temporary_store: &mut AuthorityTemporaryStore<S>,
+fn execute_transaction<S: BackingPackageStore + ParentSync>(
+    temporary_store: &mut TemporaryStore<S>,
     transaction_data: TransactionData,
     gas_object_id: ObjectID,
     tx_ctx: &mut TxContext,
@@ -232,6 +238,11 @@ fn execute_transaction<S: BackingPackageStore>(
         let cost_summary = gas_status.summary(result.is_ok());
         let gas_used = cost_summary.gas_used();
         let gas_rebate = cost_summary.storage_rebate;
+        // We must re-fetch the gas object from the temporary store, as it may have been reset
+        // previously in the case of error.
+        // TODO: It might be cleaner and less error-prone if we put gas object id into
+        // temporary store and move much of the gas logic there.
+        gas_object = temporary_store.read_object(&gas_object_id).unwrap().clone();
         gas::deduct_gas(&mut gas_object, gas_used, gas_rebate);
         trace!(gas_used, gas_obj_id =? gas_object.id(), gas_obj_ver =? gas_object.version(), "Updated gas object");
         temporary_store.write_object(gas_object);
@@ -242,12 +253,13 @@ fn execute_transaction<S: BackingPackageStore>(
 }
 
 fn transfer_object<S>(
-    temporary_store: &mut AuthorityTemporaryStore<S>,
+    temporary_store: &mut TemporaryStore<S>,
     mut object: Object,
     sender: SuiAddress,
     recipient: SuiAddress,
 ) -> Result<(), ExecutionError> {
-    object.transfer_and_increment_version(recipient)?;
+    object.ensure_public_transfer_eligible()?;
+    object.transfer_and_increment_version(recipient);
     temporary_store.log_event(Event::TransferObject {
         package_id: ObjectID::from(SUI_FRAMEWORK_ADDRESS),
         transaction_module: Identifier::from(ident_str!("native")),
@@ -269,7 +281,7 @@ fn transfer_object<S>(
 /// We make sure that the gas object's version is not incremented after this function call, because
 /// when we charge gas later, its version will be officially incremented.
 fn transfer_sui<S>(
-    temporary_store: &mut AuthorityTemporaryStore<S>,
+    temporary_store: &mut TemporaryStore<S>,
     mut object: Object,
     recipient: SuiAddress,
     amount: Option<u64>,
@@ -280,7 +292,8 @@ fn transfer_sui<S>(
 
     if let Some(amount) = amount {
         // Deduct the amount from the gas coin and update it.
-        let mut gas_coin = GasCoin::try_from(&object)?;
+        let mut gas_coin = GasCoin::try_from(&object)
+            .expect("gas object is transferred, so already checked to be a SUI coin");
         gas_coin.0.balance.withdraw(amount)?;
         let move_object = object
             .data
@@ -294,12 +307,9 @@ fn transfer_sui<S>(
         // Creat a new gas coin with the amount.
         let new_object = Object::new_move(
             MoveObject::new_gas_coin(
-                bcs::to_bytes(&GasCoin::new(
-                    tx_ctx.fresh_id(),
-                    OBJECT_START_VERSION,
-                    amount,
-                ))
-                .expect("Serializing gas object cannot fail"),
+                OBJECT_START_VERSION,
+                bcs::to_bytes(&GasCoin::new(tx_ctx.fresh_id(), amount))
+                    .expect("Serializing gas object cannot fail"),
             ),
             Owner::AddressOwner(recipient),
             tx_ctx.digest(),
@@ -312,7 +322,7 @@ fn transfer_sui<S>(
     } else {
         // If amount is not specified, we simply transfer the entire coin object.
         // We don't want to increment the version number yet because latter gas charge will do it.
-        object.transfer_without_version_change(recipient)?;
+        object.transfer_without_version_change(recipient);
     }
 
     // TODO: Emit a new event type for this.

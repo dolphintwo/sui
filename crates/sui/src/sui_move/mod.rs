@@ -8,14 +8,28 @@ use move_unit_test::UnitTestingConfig;
 use std::path::PathBuf;
 
 pub mod build;
+pub mod coverage;
+pub mod disassemble;
 pub mod new;
+pub mod prove;
 pub mod unit_test;
 
 #[derive(Parser)]
 pub enum Command {
     Build(build::Build),
+    Coverage(coverage::Coverage),
+    Disassemble(disassemble::Disassemble),
     New(new::New),
+    Prove(prove::Prove),
     Test(unit_test::Test),
+    CalibrateCosts(Calib),
+}
+#[derive(Parser)]
+pub struct Calib {
+    #[clap(name = "runs", short = 'r', long = "runs", default_value = "1")]
+    runs: usize,
+    #[clap(name = "summarize", short = 's', long = "summarize")]
+    summarize: bool,
 }
 
 pub fn execute_move_command(
@@ -25,6 +39,10 @@ pub fn execute_move_command(
 ) -> anyhow::Result<()> {
     match command {
         Command::Build(c) => c.execute(package_path, build_config),
+        Command::Coverage(c) => c.execute(package_path, build_config),
+        Command::Disassemble(c) => c.execute(package_path, build_config),
+        Command::New(c) => c.execute(package_path),
+        Command::Prove(c) => c.execute(package_path, build_config),
         Command::Test(c) => {
             let unit_test_config = UnitTestingConfig {
                 instruction_execution_bound: c.test.instruction_execution_bound,
@@ -47,6 +65,9 @@ pub fn execute_move_command(
 
             Ok(())
         }
-        Command::New(c) => c.execute(package_path),
+        Command::CalibrateCosts(c) => {
+            sui_framework::cost_calib::run_calibration(c.runs, c.summarize);
+            Ok(())
+        }
     }
 }

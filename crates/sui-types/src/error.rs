@@ -4,10 +4,10 @@
 
 use crate::{base_types::*, committee::EpochId, messages::ExecutionFailureStatus};
 use move_binary_format::errors::{Location, PartialVMError, VMError};
-use move_core_types::vm_status::{AbortLocation, StatusCode};
+use move_core_types::vm_status::{StatusCode, StatusType};
 use narwhal_executor::{ExecutionStateError, SubscriberError};
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt::Debug};
+use std::fmt::Debug;
 use thiserror::Error;
 use typed_store::rocks::TypedStoreError;
 
@@ -46,8 +46,8 @@ macro_rules! exit_main {
 #[allow(clippy::large_enum_variant)]
 pub enum SuiError {
     // Object misuse issues
-    #[error("Error acquiring lock for object(s): {:?}", errors)]
-    LockErrors { errors: Vec<SuiError> },
+    #[error("Error checking transaction input objects: {:?}", errors)]
+    ObjectErrors { errors: Vec<SuiError> },
     #[error("Attempt to transfer an object that's not owned.")]
     TransferUnownedError,
     #[error("Attempt to transfer an object that does not have public transfer. Object transfer must be done instead using a distinct Move function call.")]
@@ -79,6 +79,8 @@ pub enum SuiError {
     // Signature verification
     #[error("Signature is not valid: {}", error)]
     InvalidSignature { error: String },
+    #[error("Sender Signature must be verified separately from Authority Signature")]
+    SenderSigUnbatchable,
     #[error("Value was not signed by the correct sender: {}", error)]
     IncorrectSigner { error: String },
     #[error("Value was not signed by a known authority")]
@@ -197,6 +199,17 @@ pub enum SuiError {
     SubscriptionServiceClosed,
     #[error("Checkpointing error: {}", error)]
     CheckpointingError { error: String },
+    #[error(
+        "ExecutionDriver error for {:?}: {} - Caused by : {:#?}",
+        digest,
+        msg,
+        errors.iter().map(|e| ToString::to_string(&e)).collect::<Vec<String>>()
+    )]
+    ExecutionDriverError {
+        digest: TransactionDigest,
+        msg: String,
+        errors: Vec<SuiError>,
+    },
 
     // Move module publishing related errors
     #[error("Failed to load the Move module, reason: {error:?}.")]
@@ -277,10 +290,11 @@ pub enum SuiError {
     AuthorityInformationUnavailable,
     #[error("Failed to update authority.")]
     AuthorityUpdateFailure,
-    #[error(
-        "We have received cryptographic level of evidence that authority {authority:?} is faulty in a Byzantine manner."
-    )]
-    ByzantineAuthoritySuspicion { authority: AuthorityName },
+    #[error("Validator {authority:?} is faulty in a Byzantine manner: {reason:?}")]
+    ByzantineAuthoritySuspicion {
+        authority: AuthorityName,
+        reason: String,
+    },
     #[error(
         "Sync from authority failed. From {xsource:?} to {destination:?}, digest {tx_digest:?}: {error:?}",
     )]
@@ -327,6 +341,8 @@ pub enum SuiError {
     InconsistentGatewayResult { error: String },
     #[error("Invalid transaction range query to the gateway: {:?}", error)]
     GatewayInvalidTxRangeQuery { error: String },
+    #[error("Gateway checking transaction validity failed: {:?}", error)]
+    GatewayTransactionPrepError { error: String },
 
     // Errors related to the authority-consensus interface.
     #[error("Authority state can be modified by a single consensus client at the time")]
@@ -351,6 +367,10 @@ pub enum SuiError {
     HkdfError(String),
     #[error("Signature key generation error: {0}")]
     SignatureKeyGenError(String),
+    #[error("Key Conversion Error: {0}")]
+    KeyConversionError(String),
+    #[error("Invalid Private Key provided")]
+    InvalidPrivateKey,
 
     // Epoch related errors.
     #[error("Validator temporarily stopped processing transactions due to epoch change")]
@@ -448,53 +468,7 @@ impl ExecutionStateError for SuiError {
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq, Debug, Serialize, Deserialize)]
-pub enum ExecutionErrorKind {
-    InsufficientGas,
-
-    // Naitive Transfer errors
-    TransferUnowned,
-    TransferNonCoin,
-    TransferObjectWithoutPublicTransfer,
-    TransferInsufficientBalance,
-
-    InvalidTransactionUpdate,
-
-    ObjectNotFound,
-    /// An object that's owned by another object cannot be deleted or wrapped. It must be
-    /// transferred to an account address first before deletion
-    DeleteObjectOwnedObject,
-    /// #[error("Function resolution failure: {error:?}.")]
-    FunctionNotFound,
-    /// #[error("Module not found in package: {module_name:?}.")]
-    ModuleNotFound,
-    /// #[error("Function signature is invalid: {error:?}.")]
-    InvalidFunctionSignature,
-    /// #[error("Function visibility is invalid for an entry point to execution: {error:?}.")]
-    InvalidFunctionVisibility,
-    InvalidNonEntryFunction,
-    ExecutionInvariantViolation,
-    /// #[error("Type error while binding function arguments: {error:?}.")]
-    TypeError,
-    /// Circular object ownership detected
-    CircularObjectOwnership,
-    MissingObjectOwner,
-    InvalidSharedChildUse,
-
-    ModulePublishFailure,
-    ModuleVerificationFailure,
-
-    // Move Error
-    VmError,
-}
-
-impl std::fmt::Display for ExecutionErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ExecutionErrorKind: {:?}", self)
-    }
-}
-
-impl std::error::Error for ExecutionErrorKind {}
+pub type ExecutionErrorKind = ExecutionFailureStatus;
 
 #[derive(Debug)]
 pub struct ExecutionError {
@@ -527,84 +501,7 @@ impl ExecutionError {
     }
 
     pub fn to_execution_status(&self) -> ExecutionFailureStatus {
-        match self.kind() {
-            ExecutionErrorKind::InsufficientGas => ExecutionFailureStatus::InsufficientGas,
-            ExecutionErrorKind::TransferUnowned
-            | ExecutionErrorKind::TransferNonCoin
-            | ExecutionErrorKind::TransferObjectWithoutPublicTransfer
-            | ExecutionErrorKind::TransferInsufficientBalance
-            | ExecutionErrorKind::InvalidTransactionUpdate
-            | ExecutionErrorKind::ObjectNotFound
-            | ExecutionErrorKind::DeleteObjectOwnedObject
-            | ExecutionErrorKind::FunctionNotFound
-            | ExecutionErrorKind::ModuleNotFound
-            | ExecutionErrorKind::InvalidFunctionSignature
-            | ExecutionErrorKind::InvalidFunctionVisibility
-            | ExecutionErrorKind::InvalidNonEntryFunction
-            | ExecutionErrorKind::ExecutionInvariantViolation
-            | ExecutionErrorKind::TypeError
-            | ExecutionErrorKind::CircularObjectOwnership
-            | ExecutionErrorKind::MissingObjectOwner
-            | ExecutionErrorKind::InvalidSharedChildUse
-            | ExecutionErrorKind::ModulePublishFailure
-            | ExecutionErrorKind::ModuleVerificationFailure => {
-                ExecutionFailureStatus::MiscellaneousError
-            }
-            ExecutionErrorKind::VmError => {
-                let source = if let Some(source) = self.source() {
-                    source
-                } else {
-                    return ExecutionFailureStatus::MiscellaneousError;
-                };
-
-                if let Some(vmerror) = source.downcast_ref::<VMError>() {
-                    match (
-                        vmerror.major_status(),
-                        vmerror.sub_status(),
-                        vmerror.location(),
-                    ) {
-                        (StatusCode::EXECUTED, _, _) => {
-                            // If we have an error the status probably shouldn't ever be Executed
-                            debug_assert!(
-                                false,
-                                "VmError shouldn't ever report successful execution"
-                            );
-                        }
-                        (StatusCode::ABORTED, Some(code), Location::Script) => {
-                            return ExecutionFailureStatus::MoveAbort(AbortLocation::Script, code);
-                        }
-                        (StatusCode::ABORTED, Some(code), Location::Module(id)) => {
-                            return ExecutionFailureStatus::MoveAbort(
-                                AbortLocation::Module(id.to_owned()),
-                                code,
-                            );
-                        }
-                        (StatusCode::OUT_OF_GAS, _, _) => {
-                            return ExecutionFailureStatus::InsufficientGas;
-                        }
-                        _ => return ExecutionFailureStatus::MiscellaneousError,
-                    }
-                }
-
-                if let Some(partial_vmerror) = source.downcast_ref::<PartialVMError>() {
-                    match partial_vmerror.major_status() {
-                        StatusCode::EXECUTED => {
-                            // If we have an error the status probably shouldn't ever be Executed
-                            debug_assert!(
-                                false,
-                                "VmError shouldn't ever report successful execution"
-                            );
-                        }
-                        StatusCode::OUT_OF_GAS => {
-                            return ExecutionFailureStatus::InsufficientGas;
-                        }
-                        _ => return ExecutionFailureStatus::MiscellaneousError,
-                    }
-                }
-
-                ExecutionFailureStatus::MiscellaneousError
-            }
-        }
+        self.kind().clone()
     }
 }
 
@@ -628,12 +525,38 @@ impl From<ExecutionErrorKind> for ExecutionError {
 
 impl From<VMError> for ExecutionError {
     fn from(error: VMError) -> Self {
-        Self::new_with_source(ExecutionErrorKind::VmError, error)
-    }
-}
-
-impl From<PartialVMError> for ExecutionError {
-    fn from(error: PartialVMError) -> Self {
-        Self::new_with_source(ExecutionErrorKind::VmError, error)
+        let kind = match (error.major_status(), error.sub_status(), error.location()) {
+            (StatusCode::EXECUTED, _, _) => {
+                // If we have an error the status probably shouldn't ever be Executed
+                debug_assert!(false, "VmError shouldn't ever report successful execution");
+                ExecutionFailureStatus::VMInvariantViolation
+            }
+            (StatusCode::ABORTED, None, _) => {
+                debug_assert!(false, "No abort code");
+                // this is a Move VM invariant violation, the code should always be there
+                ExecutionFailureStatus::VMInvariantViolation
+            }
+            (StatusCode::ABORTED, _, Location::Script) => {
+                debug_assert!(false, "Scripts are not used in Sui");
+                // this is a Move VM invariant violation, in the sense that the location
+                // is malformed
+                ExecutionFailureStatus::VMInvariantViolation
+            }
+            (StatusCode::ABORTED, Some(code), Location::Module(id)) => {
+                ExecutionFailureStatus::MoveAbort(id.to_owned(), code)
+            }
+            (StatusCode::OUT_OF_GAS, _, _) => ExecutionFailureStatus::InsufficientGas,
+            _ => match error.major_status().status_type() {
+                StatusType::Execution => ExecutionFailureStatus::MovePrimitiveRuntimeError,
+                StatusType::Validation
+                | StatusType::Verification
+                | StatusType::Deserialization
+                | StatusType::Unknown => {
+                    ExecutionFailureStatus::VMVerificationOrDeserializationError
+                }
+                StatusType::InvariantViolation => ExecutionFailureStatus::VMInvariantViolation,
+            },
+        };
+        Self::new_with_source(kind, error)
     }
 }

@@ -12,7 +12,6 @@ use anyhow::Result;
 use move_binary_format::{
     access::ModuleAccess,
     binary_views::BinaryIndexedView,
-    errors::PartialVMResult,
     file_format::{AbilitySet, CompiledModule, LocalIndex, SignatureToken, StructHandleIndex},
 };
 use move_core_types::{
@@ -31,15 +30,15 @@ use sui_types::{
     error::{ExecutionErrorKind, SuiError},
     event::{Event, TransferType},
     gas::SuiGasStatus,
-    id::VersionedID,
-    messages::{CallArg, InputObjectKind, ObjectArg},
-    object::{self, Data, MoveObject, Object, Owner},
-    storage::{DeleteKind, Storage},
+    id::UID,
+    messages::{CallArg, EntryArgumentErrorKind, InputObjectKind, ObjectArg},
+    object::{self, Data, MoveObject, Object, Owner, ID_END_INDEX},
+    storage::{DeleteKind, ParentSync, Storage},
     SUI_SYSTEM_STATE_OBJECT_ID,
 };
 use sui_verifier::{
-    entry_points_verifier::{is_tx_context, INIT_FN_NAME, RESOLVED_STD_OPTION, RESOLVED_SUI_ID},
-    verifier,
+    entry_points_verifier::{is_tx_context, RESOLVED_STD_OPTION, RESOLVED_SUI_ID},
+    verifier, INIT_FN_NAME,
 };
 
 use crate::bytecode_rewriter::ModuleHandleRewriter;
@@ -59,7 +58,10 @@ pub fn new_move_vm(natives: NativeFunctionTable) -> Result<MoveVM, SuiError> {
 /// otherwise we return Ok(Ok).
 /// TODO: Do we really need the two layers?
 #[allow(clippy::too_many_arguments)]
-pub fn execute<E: Debug, S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage>(
+pub fn execute<
+    E: Debug,
+    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage + ParentSync,
+>(
     vm: &MoveVM,
     state_view: &mut S,
     module_id: ModuleId,
@@ -114,7 +116,7 @@ pub fn execute<E: Debug, S: ResourceResolver<Error = E> + ModuleResolver<Error =
 #[allow(clippy::too_many_arguments)]
 fn execute_internal<
     E: Debug,
-    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage,
+    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage + ParentSync,
 >(
     vm: &MoveVM,
     state_view: &mut S,
@@ -222,7 +224,10 @@ fn execute_internal<
     Ok(())
 }
 
-pub fn publish<E: Debug, S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage>(
+pub fn publish<
+    E: Debug,
+    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage + ParentSync,
+>(
     state_view: &mut S,
     natives: NativeFunctionTable,
     module_bytes: Vec<Vec<u8>>,
@@ -232,11 +237,14 @@ pub fn publish<E: Debug, S: ResourceResolver<Error = E> + ModuleResolver<Error =
     gas_status.charge_publish_package(module_bytes.iter().map(|v| v.len()).sum())?;
     let mut modules = module_bytes
         .iter()
-        .map(|b| CompiledModule::deserialize(b))
-        .collect::<PartialVMResult<Vec<CompiledModule>>>()?;
+        .map(|b| {
+            CompiledModule::deserialize(b)
+                .map_err(|e| e.finish(move_binary_format::errors::Location::Undefined))
+        })
+        .collect::<move_binary_format::errors::VMResult<Vec<CompiledModule>>>()?;
 
     if modules.is_empty() {
-        return Err(ExecutionErrorKind::ModulePublishFailure.into());
+        return Err(ExecutionErrorKind::PublishErrorEmptyPackage.into());
     }
 
     let package_id = generate_package_id(&mut modules, ctx)?;
@@ -251,7 +259,7 @@ pub fn publish<E: Debug, S: ResourceResolver<Error = E> + ModuleResolver<Error =
 /// Store package in state_view and call module initializers
 pub fn store_package_and_init_modules<
     E: Debug,
-    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage,
+    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage + ParentSync,
 >(
     state_view: &mut S,
     vm: &MoveVM,
@@ -262,12 +270,17 @@ pub fn store_package_and_init_modules<
     let modules_to_init = modules
         .iter()
         .filter_map(|module| {
-            module.function_defs.iter().find(|fdef| {
-                let fhandle = module.function_handle_at(fdef.function).name;
-                let fname = module.identifier_at(fhandle);
-                fname == INIT_FN_NAME
-            })?;
-            Some(module.self_id())
+            for fdef in &module.function_defs {
+                let fhandle = module.function_handle_at(fdef.function);
+                let fname = module.identifier_at(fhandle.name);
+                if fname == INIT_FN_NAME {
+                    return Some((
+                        module.self_id(),
+                        module.signature_at(fhandle.parameters).len(),
+                    ));
+                }
+            }
+            None
         })
         .collect();
 
@@ -281,16 +294,29 @@ pub fn store_package_and_init_modules<
 }
 
 /// Modules in module_ids_to_init must have the init method defined
-fn init_modules<E: Debug, S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage>(
+fn init_modules<
+    E: Debug,
+    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage + ParentSync,
+>(
     state_view: &mut S,
     vm: &MoveVM,
-    module_ids_to_init: Vec<ModuleId>,
+    module_ids_to_init: Vec<(ModuleId, usize)>,
     ctx: &mut TxContext,
     gas_status: &mut SuiGasStatus,
 ) -> Result<(), ExecutionError> {
     let init_ident = Identifier::new(INIT_FN_NAME.as_str()).unwrap();
-    for module_id in module_ids_to_init {
-        let args = vec![ctx.to_vec()];
+    for (module_id, num_args) in module_ids_to_init {
+        let mut args = vec![];
+        // an init function can have one or two arguments, with the last one always being of type
+        // &mut TxContext and the additional (first) one representing a characteristic type (see
+        // char_type verfier pass for additional explanation)
+        if num_args == 2 {
+            // characteristic type is a struct with a single bool filed which in bcs is encoded as
+            // 0x01
+            let bcs_char_type_value = vec![0x01];
+            args.push(bcs_char_type_value);
+        }
+        args.push(ctx.to_vec());
         let has_ctx_arg = true;
 
         execute_internal(
@@ -374,7 +400,7 @@ pub fn generate_package_id(
             let handle = module.module_handle_at(module.self_module_handle_idx);
             let name = module.identifier_at(handle.name);
             return Err(ExecutionError::new_with_source(
-                ExecutionErrorKind::ModulePublishFailure,
+                ExecutionErrorKind::PublishErrorNonZeroAddress,
                 format!("Publishing module {name} with non-zero address is not allowed"),
             ));
         }
@@ -384,7 +410,7 @@ pub fn generate_package_id(
         );
         if sub_map.insert(old_module_id, new_module_id).is_some() {
             return Err(ExecutionError::new_with_source(
-                ExecutionErrorKind::ModulePublishFailure,
+                ExecutionErrorKind::PublishErrorDuplicateModule,
                 "Publishing two modules with the same ID",
             ));
         }
@@ -408,7 +434,7 @@ type MoveEvent = (Vec<u8>, u64, TypeTag, AbilitySet, Vec<u8>);
 #[allow(clippy::too_many_arguments)]
 fn process_successful_execution<
     E: Debug,
-    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage,
+    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage + ParentSync,
 >(
     state_view: &mut S,
     module_id: &ModuleId,
@@ -476,61 +502,55 @@ fn process_successful_execution<
             EventType::DeleteObjectID => {
                 // unwrap safe because this event can only be emitted from processing
                 // native call delete_id, which guarantees the type of the id.
-                let id: VersionedID = bcs::from_bytes(&event_bytes).unwrap();
-                let obj_id = id.object_id();
+                let uid: UID = bcs::from_bytes(&event_bytes).unwrap();
+                let obj_id = uid.object_id();
                 // We don't care about IDs that are generated in this same transaction
                 // but only to be deleted.
                 if !newly_generated_ids.contains(obj_id) {
-                    match by_value_objects.remove(id.object_id()) {
-                        Some((Owner::ObjectOwner { .. }, _)) => {
-                            // If an object is owned by another object, we are not allowed to directly delete the child
-                            // object because this could lead to a dangling reference of the ownership. Such
-                            // dangling reference can never be dropped. To delete this object, one must either first transfer
-                            // the child object to an account address, or call through transfer::delete_child_object(),
-                            // which would consume both the child object and the ChildRef ownership reference,
-                            // and emit the DeleteChildObject event. These child objects can be safely deleted.
-                            return Err(ExecutionErrorKind::DeleteObjectOwnedObject.into());
-                        }
-                        Some(_) => {
+                    match by_value_objects.remove(obj_id) {
+                        Some((_, version)) => {
                             state_view.log_event(Event::delete_object(
                                 module_id.address(),
                                 module_id.name(),
                                 ctx.sender(),
                                 *obj_id,
                             ));
-                            state_view.delete_object(obj_id, id.version(), DeleteKind::Normal)
+                            state_view.delete_object(obj_id, version, DeleteKind::Normal)
                         }
                         None => {
                             // This object wasn't in the input, and is being deleted. It must
                             // be unwrapped in this transaction and then get deleted.
                             // When an object was wrapped at version `v`, we added an record into `parent_sync`
                             // with version `v+1` along with OBJECT_DIGEST_WRAPPED. Now when the object is unwrapped,
-                            // it will also have version `v+1`, leading to a violation of the invariant that any
-                            // object_id and version pair must be unique. Hence for any object that's just unwrapped,
-                            // we force incrementing its version number again to make it `v+2` before writing to the store.
+                            // we force it to `v+2` by fetching the old version from `parent_sync`.
+                            // This ensures that the object_id and version pair will be unique.
+                            // Here it is set to `v+1` and will be incremented in `delete_object`
                             state_view.log_event(Event::delete_object(
                                 module_id.address(),
                                 module_id.name(),
                                 ctx.sender(),
                                 *obj_id,
                             ));
+                            let previous_version =
+                                match state_view.get_latest_parent_entry_ref(*obj_id) {
+                                    Ok(Some((_, previous_version, _))) => previous_version,
+                                    // TODO this error is (hopefully) transient and should not be
+                                    // a normal execution error
+                                    _ => {
+                                        return Err(ExecutionError::new_with_source(
+                                            ExecutionErrorKind::InvariantViolation,
+                                            missing_unwrapped_msg(obj_id),
+                                        ));
+                                    }
+                                };
                             state_view.delete_object(
                                 obj_id,
-                                id.version().increment(),
+                                previous_version,
                                 DeleteKind::UnwrapThenDelete,
                             )
                         }
                     }
                 }
-                Ok(())
-            }
-            EventType::DeleteChildObject => {
-                let id_bytes: AccountAddress = bcs::from_bytes(&event_bytes).unwrap();
-                let obj_id: ObjectID = id_bytes.into();
-                // unwrap safe since to delete a child object, this child object
-                // must be passed by value in the input.
-                let (_owner, version) = by_value_objects.remove(&obj_id).unwrap();
-                state_view.delete_object(&obj_id, version, DeleteKind::Normal);
                 Ok(())
             }
             EventType::User => {
@@ -564,7 +584,7 @@ fn process_successful_execution<
 #[allow(clippy::too_many_arguments)]
 fn handle_transfer<
     E: Debug,
-    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage,
+    S: ResourceResolver<Error = E> + ModuleResolver<Error = E> + Storage + ParentSync,
 >(
     sender: SuiAddress,
     recipient: Owner,
@@ -578,95 +598,114 @@ fn handle_transfer<
     object_owner_map: &mut BTreeMap<SuiAddress, SuiAddress>,
     newly_generated_ids: &HashSet<ObjectID>,
 ) -> Result<(), ExecutionError> {
-    match type_ {
-        TypeTag::Struct(s_type) => {
-            let has_public_transfer = abilities.has_store();
-            // safe because `has_public_transfer` was properly determined from the abilities
-            let mut move_obj =
-                unsafe { MoveObject::new_from_execution(s_type, has_public_transfer, contents) };
-            let old_object = by_value_objects.remove(&move_obj.id());
-
-            #[cfg(debug_assertions)]
-            {
-                check_transferred_object_invariants(&move_obj, &old_object)
-            }
-
-            // increment the object version. note that if the transferred object was
-            // freshly created, this means that its version will now be 1.
-            // thus, all objects in the global object pool have version > 0
-            move_obj.increment_version();
-            let obj_id = move_obj.id();
-            // A to-be-transferred object can come from 3 sources:
-            //   1. Passed in by-value (in `by_value_objects`, i.e. old_object is not none)
-            //   2. Created in this transaction (in `newly_generated_ids`)
-            //   3. Unwrapped in this transaction
-            // The following condition checks if this object was unwrapped in this transaction.
-            if old_object.is_none() {
-                // Newly created object
-                if newly_generated_ids.contains(&obj_id) || obj_id == SUI_SYSTEM_STATE_OBJECT_ID {
-                    state_view.log_event(Event::new_object(
-                        module_id.address(),
-                        module_id.name(),
-                        sender,
-                        recipient,
-                        obj_id,
-                    ));
-                } else {
-                    // When an object was wrapped at version `v`, we added an record into `parent_sync`
-                    // with version `v+1` along with OBJECT_DIGEST_WRAPPED. Now when the object is unwrapped,
-                    // it will also have version `v+1`, leading to a violation of the invariant that any
-                    // object_id and version pair must be unique. Hence for any object that's just unwrapped,
-                    // we force incrementing its version number again to make it `v+2` before writing to the store.
-                    move_obj.increment_version();
-                }
-            } else if let Some((_, old_obj_ver)) = old_object {
-                // Some kind of transfer since there's an old object
-                // Add an event for the transfer
-                let transfer_type = match recipient {
-                    Owner::AddressOwner(_) => Some(TransferType::ToAddress),
-                    Owner::ObjectOwner(_) => Some(TransferType::ToObject),
-                    _ => None,
-                };
-                if let Some(type_) = transfer_type {
-                    state_view.log_event(Event::TransferObject {
-                        package_id: ObjectID::from(*module_id.address()),
-                        transaction_module: Identifier::from(module_id.name()),
-                        sender,
-                        recipient,
-                        object_id: obj_id,
-                        version: old_obj_ver,
-                        type_,
-                    })
-                }
-            }
-            let obj = Object::new_move(move_obj, recipient, tx_digest);
-            if old_object.is_none() {
-                // Charge extra gas based on object size if we are creating a new object.
-                // TODO: Do we charge extra gas when creating new objects (on top of storage write cost)?
-            }
-            let obj_address: SuiAddress = obj_id.into();
-            object_owner_map.remove(&obj_address);
-            if let Owner::ObjectOwner(new_owner) = recipient {
-                // Below we check whether the transfer introduced any circular ownership.
-                // We know that for any mutable object, all its ancenstors (if it was owned by another object)
-                // must be in the input as well. Prior to this we have recorded the original ownership mapping
-                // in object_owner_map. For any new transfer, we trace the new owner through the ownership
-                // chain to see if a cycle is detected.
-                // TODO: Set a constant upper bound to the depth of the new ownership chain.
-                let mut parent = new_owner;
-                while parent != obj_address && object_owner_map.contains_key(&parent) {
-                    parent = *object_owner_map.get(&parent).unwrap();
-                }
-                if parent == obj_address {
-                    return Err(ExecutionErrorKind::CircularObjectOwnership.into());
-                }
-                object_owner_map.insert(obj_address, new_owner);
-            }
-
-            state_view.write_object(obj);
-        }
+    let s_type = match type_ {
+        TypeTag::Struct(s_type) => s_type,
         _ => unreachable!("Only structs can be transferred"),
+    };
+    let has_public_transfer = abilities.has_store();
+    debug_assert!(abilities.has_key(), "objects should have key");
+    let id = ObjectID::try_from(&contents[0..ID_END_INDEX])
+        .expect("object contents should start with an id");
+    let old_object = by_value_objects.remove(&id);
+    let is_unwrapped = !(newly_generated_ids.contains(&id) || id == SUI_SYSTEM_STATE_OBJECT_ID);
+    let version = match old_object {
+        Some((_, version)) => version,
+        // When an object was wrapped at version `v`, we added an record into `parent_sync`
+        // with version `v+1` along with OBJECT_DIGEST_WRAPPED. Now when the object is unwrapped,
+        // it will also have version `v+1`, leading to a violation of the invariant that any
+        // object_id and version pair must be unique. We use the version from parent_sync and
+        // increment it (below), so we will have `(v+1)+1`, thus preserving the uniqueness
+        None if is_unwrapped => match state_view.get_latest_parent_entry_ref(id) {
+            Ok(Some((_, last_version, _))) => last_version,
+            _ => {
+                // TODO this error is (hopefully) transient and should not be
+                // a normal execution error
+                return Err(ExecutionError::new_with_source(
+                    ExecutionErrorKind::InvariantViolation,
+                    missing_unwrapped_msg(&id),
+                ));
+            }
+        },
+        None => SequenceNumber::new(),
+    };
+
+    // safe because `has_public_transfer` was properly determined from the abilities
+    let mut move_obj =
+        unsafe { MoveObject::new_from_execution(s_type, has_public_transfer, version, contents) };
+
+    debug_assert_eq!(id, move_obj.id());
+
+    #[cfg(debug_assertions)]
+    {
+        check_transferred_object_invariants(&move_obj, &old_object)
     }
+
+    // increment the object version. note that if the transferred object was
+    // freshly created, this means that its version will now be 1.
+    // thus, all objects in the global object pool have version > 0
+    move_obj.increment_version();
+    let obj_id = move_obj.id();
+    // A to-be-transferred object can come from 3 sources:
+    //   1. Passed in by-value (in `by_value_objects`, i.e. old_object is not none)
+    //   2. Created in this transaction (in `newly_generated_ids`)
+    //   3. Unwrapped in this transaction
+    // The following condition checks if this object was unwrapped in this transaction.
+    if let Some((_, old_obj_ver)) = old_object {
+        // Some kind of transfer since there's an old object
+        // Add an event for the transfer
+        let transfer_type = match recipient {
+            Owner::AddressOwner(_) => Some(TransferType::ToAddress),
+            Owner::ObjectOwner(_) => Some(TransferType::ToObject),
+            _ => None,
+        };
+        if let Some(type_) = transfer_type {
+            state_view.log_event(Event::TransferObject {
+                package_id: ObjectID::from(*module_id.address()),
+                transaction_module: Identifier::from(module_id.name()),
+                sender,
+                recipient,
+                object_id: obj_id,
+                version: old_obj_ver,
+                type_,
+            })
+        }
+    } else {
+        // Newly created object
+        if !is_unwrapped {
+            state_view.log_event(Event::new_object(
+                module_id.address(),
+                module_id.name(),
+                sender,
+                recipient,
+                obj_id,
+            ));
+        }
+    }
+    let obj = Object::new_move(move_obj, recipient, tx_digest);
+    if old_object.is_none() {
+        // Charge extra gas based on object size if we are creating a new object.
+        // TODO: Do we charge extra gas when creating new objects (on top of storage write cost)?
+    }
+    let obj_address: SuiAddress = obj_id.into();
+    object_owner_map.remove(&obj_address);
+    if let Owner::ObjectOwner(new_owner) = recipient {
+        // Below we check whether the transfer introduced any circular ownership.
+        // We know that for any mutable object, all its ancenstors (if it was owned by another object)
+        // must be in the input as well. Prior to this we have recorded the original ownership mapping
+        // in object_owner_map. For any new transfer, we trace the new owner through the ownership
+        // chain to see if a cycle is detected.
+        // TODO: Set a constant upper bound to the depth of the new ownership chain.
+        let mut parent = new_owner;
+        while parent != obj_address && object_owner_map.contains_key(&parent) {
+            parent = *object_owner_map.get(&parent).unwrap();
+        }
+        if parent == obj_address {
+            return Err(ExecutionErrorKind::circular_object_ownership(parent.into()).into());
+        }
+        object_owner_map.insert(obj_address, new_owner);
+    }
+
+    state_view.write_object(obj);
     Ok(())
 }
 
@@ -731,7 +770,7 @@ pub fn resolve_and_type_check(
     // functions, and as such need to bypass this check.
     if !fdef.is_entry && !is_genesis {
         return Err(ExecutionError::new_with_source(
-            ExecutionErrorKind::InvalidNonEntryFunction,
+            ExecutionErrorKind::NonEntryFunctionInvoked,
             "Can only call `entry` functions",
         ));
     }
@@ -740,7 +779,7 @@ pub fn resolve_and_type_check(
     // check arity of type and value arguments
     if fhandle.type_parameters.len() != type_args.len() {
         return Err(ExecutionError::new_with_source(
-            ExecutionErrorKind::InvalidFunctionSignature,
+            ExecutionErrorKind::EntryTypeArityMismatch,
             format!(
                 "Expected {:?} type arguments, but found {:?}",
                 fhandle.type_parameters.len(),
@@ -761,8 +800,9 @@ pub fn resolve_and_type_check(
         args.len()
     };
     if parameters.len() != num_args {
+        let idx = std::cmp::min(parameters.len(), num_args) as LocalIndex;
         return Err(ExecutionError::new_with_source(
-            ExecutionErrorKind::InvalidFunctionSignature,
+            ExecutionErrorKind::entry_argument_error(idx, EntryArgumentErrorKind::ArityMismatch),
             format!(
                 "Expected {:?} arguments calling function '{}', but found {:?}",
                 parameters.len(),
@@ -785,18 +825,22 @@ pub fn resolve_and_type_check(
         .enumerate()
         .map(|(idx, arg)| {
             let param_type = &parameters[idx];
+            let idx = idx as LocalIndex;
             let object_kind = match arg {
                 CallArg::Pure(arg) => {
                     if !is_primitive(view, type_args, param_type) {
-                        return Err(
-                            ExecutionError::new_with_source(
-                                ExecutionErrorKind::TypeError,
-                                format!(
-                                    "Non-primitive argument at index {}. If it is an object, it must be populated by an object ID",
-                                    idx,
-                                ),
-                            )
+                        let msg = format!(
+                            "Non-primitive argument at index {}. If it is an object, it must be \
+                            populated by an object ID",
+                            idx,
                         );
+                        return Err(ExecutionError::new_with_source(
+                            ExecutionErrorKind::entry_argument_error(
+                                idx,
+                                EntryArgumentErrorKind::UnsupportedPureArg,
+                            ),
+                            msg,
+                        ));
                     }
                     return Ok(arg);
                 }
@@ -817,7 +861,7 @@ pub fn resolve_and_type_check(
                         "Object map not populated for arg {} with id {}",
                         idx, id
                     );
-                    return Err(ExecutionErrorKind::ExecutionInvariantViolation.into());
+                    return Err(ExecutionErrorKind::InvariantViolation.into());
                 }
             };
             match object_kind {
@@ -828,7 +872,10 @@ pub fn resolve_and_type_check(
                         idx, id
                     );
                     return Err(ExecutionError::new_with_source(
-                        ExecutionErrorKind::TypeError,
+                        ExecutionErrorKind::entry_argument_error(
+                            idx,
+                            EntryArgumentErrorKind::ObjectKindMismatch,
+                        ),
                         error,
                     ));
                 }
@@ -839,7 +886,10 @@ pub fn resolve_and_type_check(
                         idx, id
                     );
                     return Err(ExecutionError::new_with_source(
-                        ExecutionErrorKind::TypeError,
+                        ExecutionErrorKind::entry_argument_error(
+                            idx,
+                            EntryArgumentErrorKind::ObjectKindMismatch,
+                        ),
                         error,
                     ));
                 }
@@ -855,7 +905,10 @@ pub fn resolve_and_type_check(
                         param_type
                     );
                     return Err(ExecutionError::new_with_source(
-                        ExecutionErrorKind::TypeError,
+                        ExecutionErrorKind::entry_argument_error(
+                            idx,
+                            EntryArgumentErrorKind::TypeMismatch,
+                        ),
                         error,
                     ));
                 }
@@ -871,7 +924,10 @@ pub fn resolve_and_type_check(
                             idx
                         );
                         return Err(ExecutionError::new_with_source(
-                            ExecutionErrorKind::TypeError,
+                            ExecutionErrorKind::entry_argument_error(
+                                idx,
+                                EntryArgumentErrorKind::InvalidObjectByMuteRef,
+                            ),
                             error,
                         ));
                     }
@@ -881,23 +937,31 @@ pub fn resolve_and_type_check(
                 t @ SignatureToken::Struct(_)
                 | t @ SignatureToken::StructInstantiation(_, _)
                 | t @ SignatureToken::TypeParameter(_) => {
-                    if !object.is_owned() {
-                        // Forbid passing shared (both mutable and immutable) object by value.
-                        // This ensures that shared object cannot be transferred, deleted or wrapped.
-                        return Err(ExecutionError::new_with_source(
-                            ExecutionErrorKind::TypeError,
-                            format!(
-                                "Only owned object can be passed by-value, violation found in argument {}",
-                                idx
-                            ),
-                        ));
+                    match &object.owner {
+                        Owner::AddressOwner(_) | Owner::ObjectOwner(_) => (),
+                        Owner::Shared | Owner::Immutable => {
+                            return Err(ExecutionError::new_with_source(
+                                ExecutionErrorKind::entry_argument_error(
+                                    idx,
+                                    EntryArgumentErrorKind::InvalidObjectByValue,
+                                ),
+                                format!(
+                                    "Immutable and shared objects cannot be passed by-value, \
+                                    violation found in argument {}",
+                                    idx
+                                ),
+                            ));
+                        }
                     }
                     by_value_objects.insert(id);
                     t
                 }
                 t => {
                     return Err(ExecutionError::new_with_source(
-                        ExecutionErrorKind::TypeError,
+                        ExecutionErrorKind::entry_argument_error(
+                            idx,
+                            EntryArgumentErrorKind::TypeMismatch,
+                        ),
                         format!(
                             "Found object argument {}, but function expects {:?}",
                             move_object.type_, t
@@ -905,13 +969,18 @@ pub fn resolve_and_type_check(
                     ));
                 }
             };
-            type_check_struct(view, type_args, &move_object.type_, inner_param_type)?;
+            type_check_struct(view, type_args, idx, &move_object.type_, inner_param_type)?;
             object_type_map.insert(id, move_object.type_.module_id());
             Ok(object_arg)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    check_child_object_of_shared_object(objects, &object_type_map, module.self_id())?;
+    check_shared_object_rules(
+        objects,
+        &by_value_objects,
+        &object_type_map,
+        module.self_id(),
+    )?;
 
     Ok(TypeCheckSuccess {
         module_id,
@@ -923,11 +992,17 @@ pub fn resolve_and_type_check(
     })
 }
 
-/// Check that for each pair of a shared object and a descendant of it (through object ownership),
-/// at least one of the types of the shared object and the descendant must be defined in the
-/// same module as the function being called (somewhat similar to Rust's orphan rule).
-fn check_child_object_of_shared_object(
+/// Check rules for shared object + by-value child rules and rules for by-value shared object rules:
+/// - For each pair of a shared object and a descendant of it (through object ownership), if the
+///   descendant is used by-value, at least one of the types of the shared object and the descendant
+///   must be defined in the same module as the entry function being called
+///   (somewhat similar to Rust's orphan rule where a trait impl must be defined in the same crate
+///   as the type implementing the trait or the trait itself).
+/// - For each shared object used by-value, the type of the shared object must be defined in the
+///   same module as the entry function being called.
+fn check_shared_object_rules(
     objects: &BTreeMap<ObjectID, impl Borrow<Object>>,
+    by_value_objects: &BTreeSet<ObjectID>,
     object_type_map: &BTreeMap<ObjectID, ModuleId>,
     current_module: ModuleId,
 ) -> Result<(), ExecutionError> {
@@ -936,31 +1011,57 @@ fn check_child_object_of_shared_object(
         .map(|(id, obj)| (*id, obj.borrow().owner))
         .collect();
     let ancestor_map = ObjectRootAncestorMap::new(&object_owner_map)?;
-    for (object_id, owner) in object_owner_map {
-        // We are only interested in objects owned by objects.
-        if !matches!(owner, Owner::ObjectOwner(..)) {
-            continue;
-        }
-        let (ancestor_id, ancestor_owner) = ancestor_map.get_root_ancestor(&object_id)?;
+    let by_value_object_owned = object_owner_map
+        .iter()
+        .filter_map(|(id, owner)| match owner {
+            Owner::ObjectOwner(owner) if by_value_objects.contains(id) => Some((*id, *owner)),
+            _ => None,
+        });
+    for (child_id, owner) in by_value_object_owned {
+        let (ancestor_id, ancestor_owner) = match ancestor_map.get_root_ancestor(&child_id) {
+            Some(ancestor) => ancestor,
+            None => return Err(ExecutionErrorKind::missing_object_owner(child_id, owner).into()),
+        };
         if ancestor_owner.is_shared() {
             // unwrap safe because the object ID exists in object_owner_map.
-            let child_module = object_type_map.get(&object_id).unwrap();
+            let child_module = object_type_map.get(&child_id).unwrap();
             let ancestor_module = object_type_map.get(&ancestor_id).unwrap();
             if !(child_module == &current_module || ancestor_module == &current_module) {
-                return Err(ExecutionError::new_with_source(ExecutionErrorKind::InvalidSharedChildUse,
+                return Err(ExecutionError::new_with_source(
+                    ExecutionErrorKind::invalid_shared_child_use(child_id, ancestor_id),
                     format!(
-        "When an (either direct or indirect) child object of a shared object is passed as a Move argument,\
-        either the child object's type or the shared object's type must be defined in the same module \
-        as the called function. This is violated by object {child} (defined in module '{child_module}'), \
-        whose ancestor {ancestor} is a shared object (defined in module '{ancestor_module}'), \
-        and neither are defined in this module '{current_module}'",
-                    child = object_id,
-                    child_module = current_module,
-                    ancestor = ancestor_id,
-                    )));
+        "When a child object (either direct or indirect) of a shared object is passed by-value to \
+        an entry function, either the child object's type or the shared object's type must be \
+        defined in the same module as the called function. This is violated by object {child_id} \
+        (defined in module '{child_module}'), whose ancestor {ancestor_id} is a shared \
+        object (defined in module '{ancestor_module}'), and neither are defined in this module \
+        '{current_module}'",
+                    ),
+                ));
             }
         }
     }
+
+    // TODO not yet supported
+    // // check shared object by value rule
+    // let by_value_shared_object = object_owner_map
+    //     .iter()
+    //     .filter(|(id, owner)| matches!(owner, Owner::Shared) && by_value_objects.contains(id))
+    //     .map(|(id, _)| *id);
+    // for shared_object_id in by_value_shared_object {
+    //     let shared_object_module = object_type_map.get(&shared_object_id).unwrap();
+    //     if shared_object_module != &current_module {
+    //         return Err(ExecutionError::new_with_source(
+    //             ExecutionErrorKind::invalid_shared_by_value(shared_object_id),
+    //             format!(
+    //     "When a shared object is passed as an owned Move value in an entry function, either the \
+    //     the shared object's type must be defined in the same module as the called function. The \
+    //     shared object {shared_object_id} (defined in module '{shared_object_module}') is not \
+    //     defined in this module '{current_module}'",
+    //             ),
+    //         ));
+    //     }
+    // }
     Ok(())
 }
 
@@ -1029,12 +1130,13 @@ fn is_primitive_type_tag(t: &TypeTag) -> bool {
 fn type_check_struct(
     view: &BinaryIndexedView,
     function_type_arguments: &[TypeTag],
+    idx: LocalIndex,
     arg_type: &StructTag,
     param_type: &SignatureToken,
 ) -> Result<(), ExecutionError> {
     if !struct_tag_equals_sig_token(view, function_type_arguments, arg_type, param_type) {
         Err(ExecutionError::new_with_source(
-            ExecutionErrorKind::TypeError,
+            ExecutionErrorKind::entry_argument_error(idx, EntryArgumentErrorKind::TypeMismatch),
             format!(
                 "Expected argument of type {}, but found type {}",
                 sui_verifier::format_signature_token(view, param_type),
@@ -1126,4 +1228,11 @@ fn struct_tag_equals_struct_inst(
                 )
             },
         )
+}
+
+fn missing_unwrapped_msg(id: &ObjectID) -> String {
+    format!(
+        "Unable to unwrap object {}. Was unable to retrieve last known version in the parent sync",
+        id
+    )
 }

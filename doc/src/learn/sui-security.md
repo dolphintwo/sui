@@ -55,7 +55,7 @@ allow smart contracts to define custom access control logic. A user may have one
 multiple signature keys for convenience or privacy reasons. An address does not need any pre-registration, and sending
 an asset to an address automatically creates this address on the network. However, this means that users should
 be careful to check the recipient address of transfers, or parties involved in any other operations, as sending assets to
-an in correct address may have irrevocable effects.
+an incorrect address may have irrevocable effects.
 
 ### Smart contracts define asset types and their logic
 
@@ -67,7 +67,7 @@ For this reason, users are encouraged to operate on their assets using smart con
 they trust have audited, and understand the logic they define for operations on their assets. Sui smart contracts are 
 defined as immutable assets to allow third parties to audit them and also prevent their modification to increase assurance. 
 The Move smart contract language that Sui uses is designed with ease of audit and verification in mind. You may be 
-interested in our introduction to [Smart Contracts in Move](../build/move.md).
+interested in our introduction to [Smart Contracts in Move](../build/move/index.md).
 
 Shared assets allow multiple users to operate on them through transactions; that may include some of their owned assets
 as well as one or more shared assets. These shared assets represent data and logic used to implement protocols that mediate
@@ -80,7 +80,7 @@ on which address and how the shared assets may be used.
 A valid transaction submitted to all validators to be certified and its certificate also has to be submitted to all validators
 to be finalized. Even if a subset of validators do not follow the protocol, the transaction can be finalized through the
 remaining validators that correctly follow the Sui protocol. This is achieved through the use of cryptographic
-Byzantine fault tolerant agremment protocols for broadcast and consensus defined by the Sui protocol. These protocols
+Byzantine fault tolerant agreement protocols for broadcast and consensus defined by the Sui protocol. These protocols
 ensure both safety, meaning that the incorrect validators cannot convince correct clients of incorrect state, and
 liveness, meaning that incorrect validators cannot prevent transaction processing.
 
@@ -99,7 +99,7 @@ changes the transaction resulted in are final.
 
 ### Auditing and privacy
 
-Sui validators provide facilities for users to read all asserts they store, as well as the historical record of
+Sui validators provide facilities for users to read all assets they store, as well as the historical record of
 transactions they have processed that led to these assets. Validators also provide cryptographic evidence of the full
 chain of transactions that contributed to an asset state. User clients can request and validate this chain of 
 evidence to ensure all operations were correct and the result of the collective agreement between validators.

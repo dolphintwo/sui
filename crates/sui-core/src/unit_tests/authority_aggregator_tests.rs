@@ -1,71 +1,78 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use move_core_types::{account_address::AccountAddress, ident_str};
 use signature::Signer;
 
 use sui_adapter::genesis;
 use sui_config::genesis::Genesis;
-use sui_types::crypto::Signature;
-use sui_types::crypto::{get_key_pair, PublicKeyBytes};
+use sui_config::ValidatorInfo;
+use sui_types::crypto::{get_key_pair, AccountKeyPair, AuthorityKeyPair, AuthorityPublicKeyBytes};
+use sui_types::crypto::{KeypairTraits, Signature};
 
-use sui_types::messages::Transaction;
+use sui_types::messages::*;
 use sui_types::object::{Object, GAS_VALUE_FOR_TESTING};
 
 use super::*;
 use crate::authority::AuthorityState;
-use crate::authority_client::LocalAuthorityClient;
-use crate::authority_client::LocalAuthorityClientFaultConfig;
+use crate::authority_client::{
+    AuthorityAPI, BatchInfoResponseItemStream, LocalAuthorityClient,
+    LocalAuthorityClientFaultConfig,
+};
 
-pub fn authority_genesis_objects(
-    authority_count: usize,
-    objects_per_authority: Vec<Object>,
-) -> Vec<Vec<Object>> {
-    let mut objects = vec![];
-    for _ in 0..authority_count {
-        objects.push(objects_per_authority.clone());
-    }
-    objects
-}
+use tokio::time::Instant;
 
 pub async fn init_local_authorities(
-    genesis_objects: Vec<Vec<Object>>,
+    committee_size: usize,
+    genesis_objects: Vec<Object>,
 ) -> (
     AuthorityAggregator<LocalAuthorityClient>,
     Vec<Arc<AuthorityState>>,
 ) {
-    let genesis = sui_config::genesis::Genesis::get_default_genesis();
-    init_local_authorities_with_genesis(&genesis, genesis_objects).await
+    let mut builder = sui_config::genesis::Builder::new().add_objects(genesis_objects);
+    let mut key_pairs = Vec::new();
+    for i in 0..committee_size {
+        let (_, key_pair): (_, AuthorityKeyPair) = get_key_pair();
+        let authority_name = key_pair.public().into();
+        let validator_info = ValidatorInfo {
+            name: format!("validator-{i}"),
+            public_key: authority_name,
+            stake: 1,
+            delegation: 0,
+            network_address: sui_config::utils::new_network_address(),
+            narwhal_primary_to_primary: sui_config::utils::new_network_address(),
+            narwhal_worker_to_primary: sui_config::utils::new_network_address(),
+            narwhal_primary_to_worker: sui_config::utils::new_network_address(),
+            narwhal_worker_to_worker: sui_config::utils::new_network_address(),
+            narwhal_consensus_address: sui_config::utils::new_network_address(),
+        };
+        builder = builder.add_validator(validator_info);
+        key_pairs.push((authority_name, key_pair));
+    }
+    let genesis = builder.build();
+    init_local_authorities_with_genesis(&genesis, key_pairs).await
 }
 
 pub async fn init_local_authorities_with_genesis(
     genesis: &Genesis,
-    genesis_objects: Vec<Vec<Object>>,
+    key_pairs: Vec<(AuthorityPublicKeyBytes, AuthorityKeyPair)>,
 ) -> (
     AuthorityAggregator<LocalAuthorityClient>,
     Vec<Arc<AuthorityState>>,
 ) {
     telemetry_subscribers::init_for_testing();
-    let mut key_pairs = Vec::new();
-    let mut voting_rights = BTreeMap::new();
-    for _ in 0..genesis_objects.len() {
-        let (_, key_pair) = get_key_pair();
-        let authority_name = *key_pair.public_key_bytes();
-        voting_rights.insert(authority_name, 1);
-        key_pairs.push((authority_name, key_pair));
-    }
-    let committee = Committee::new(0, voting_rights).unwrap();
+    let committee = genesis.committee().unwrap();
 
     let mut clients = BTreeMap::new();
     let mut states = Vec::new();
-    for ((authority_name, secret), objects) in key_pairs.into_iter().zip(genesis_objects) {
+    for (authority_name, secret) in key_pairs {
         let client = LocalAuthorityClient::new_with_objects(
             committee.clone(),
             authority_name,
             secret,
-            objects,
+            genesis.objects().to_owned(),
             genesis,
         )
         .await;
@@ -77,12 +84,13 @@ pub async fn init_local_authorities_with_genesis(
         pre_quorum_timeout: Duration::from_secs(5),
         post_quorum_timeout: Duration::from_secs(5),
         serial_authority_request_timeout: Duration::from_secs(1),
+        serial_authority_request_interval: Duration::from_secs(1),
     };
     (
         AuthorityAggregator::new_with_timeouts(
             committee,
             clients,
-            GatewayMetrics::new_for_tests(),
+            AuthAggMetrics::new_for_tests(),
             timeouts,
         ),
         states,
@@ -121,7 +129,7 @@ pub fn transfer_coin_transaction(
     )
 }
 
-fn transfer_object_move_transaction(
+pub fn transfer_object_move_transaction(
     src: SuiAddress,
     secret: &dyn signature::Signer<Signature>,
     dest: SuiAddress,
@@ -263,7 +271,7 @@ where
         {
             votes.push((
                 signed.auth_sign_info.authority,
-                signed.auth_sign_info.signature,
+                signed.auth_sign_info.signature.clone(),
             ));
             if let Some(inner_transaction) = transaction {
                 assert!(inner_transaction.data == signed.data);
@@ -293,7 +301,7 @@ where
     A: AuthorityAPI + Send + Sync + Clone + 'static,
 {
     authority
-        .handle_confirmation_transaction(ConfirmationTransaction::new(cert.clone()))
+        .handle_certificate(cert.clone())
         .await
         .unwrap()
         .signed_effects
@@ -305,9 +313,7 @@ pub async fn do_cert_configurable<A>(authority: &A, cert: &CertifiedTransaction)
 where
     A: AuthorityAPI + Send + Sync + Clone + 'static,
 {
-    let result = authority
-        .handle_confirmation_transaction(ConfirmationTransaction::new(cert.clone()))
-        .await;
+    let result = authority.handle_certificate(cert.clone()).await;
     if result.is_err() {
         println!("Error in do cert {:?}", result.err());
     }
@@ -332,17 +338,14 @@ where
 }
 
 async fn execute_transaction_with_fault_configs(
-    genesis: &Genesis,
     configs_before_process_transaction: &[(usize, LocalAuthorityClientFaultConfig)],
     configs_before_process_certificate: &[(usize, LocalAuthorityClientFaultConfig)],
 ) -> SuiResult {
-    let (addr1, key1) = get_key_pair();
-    let (addr2, _) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let (addr2, _): (_, AccountKeyPair) = get_key_pair();
     let gas_object1 = Object::with_owner_for_testing(addr1);
     let gas_object2 = Object::with_owner_for_testing(addr1);
-    let genesis_objects =
-        authority_genesis_objects(4, vec![gas_object1.clone(), gas_object2.clone()]);
-    let mut authorities = init_local_authorities_with_genesis(genesis, genesis_objects)
+    let mut authorities = init_local_authorities(4, vec![gas_object1.clone(), gas_object2.clone()])
         .await
         .0;
 
@@ -372,7 +375,7 @@ async fn execute_transaction_with_fault_configs(
 
 #[tokio::test]
 async fn test_map_reducer() {
-    let (authorities, _) = init_local_authorities(authority_genesis_objects(4, vec![])).await;
+    let (authorities, _) = init_local_authorities(4, vec![]).await;
 
     // Test: reducer errors get propagated up
     let res = authorities
@@ -496,14 +499,13 @@ async fn test_map_reducer() {
 
 #[tokio::test]
 async fn test_get_all_owned_objects() {
-    let (addr1, key1) = get_key_pair();
-    let (addr2, _) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let (addr2, _): (_, AccountKeyPair) = get_key_pair();
     let gas_object1 = Object::with_owner_for_testing(addr1);
     let gas_ref_1 = gas_object1.compute_object_reference();
     let gas_object2 = Object::with_owner_for_testing(addr2);
-    let genesis_objects =
-        authority_genesis_objects(4, vec![gas_object1.clone(), gas_object2.clone()]);
-    let (authorities, _) = init_local_authorities(genesis_objects).await;
+    let (authorities, _) =
+        init_local_authorities(4, vec![gas_object1.clone(), gas_object2.clone()]).await;
     let authority_clients: Vec<_> = authorities.authority_clients.values().collect();
 
     // Make a schedule of transactions
@@ -585,13 +587,12 @@ async fn test_get_all_owned_objects() {
 
 #[tokio::test]
 async fn test_sync_all_owned_objects() {
-    let (addr1, key1) = get_key_pair();
-    let (addr2, _) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let (addr2, _): (_, AccountKeyPair) = get_key_pair();
     let gas_object1 = Object::with_owner_for_testing(addr1);
     let gas_object2 = Object::with_owner_for_testing(addr1);
-    let genesis_objects =
-        authority_genesis_objects(4, vec![gas_object1.clone(), gas_object2.clone()]);
-    let (authorities, _) = init_local_authorities(genesis_objects).await;
+    let (authorities, _) =
+        init_local_authorities(4, vec![gas_object1.clone(), gas_object2.clone()]).await;
     let authority_clients: Vec<_> = authorities.authority_clients.values().collect();
 
     let framework_obj_ref = genesis::get_framework_object_ref();
@@ -695,57 +696,10 @@ async fn test_sync_all_owned_objects() {
     );
 }
 
-#[tokio::test]
-async fn test_process_transaction1() {
-    let (addr1, key1) = get_key_pair();
-    let gas_object1 = Object::with_owner_for_testing(addr1);
-    let gas_object2 = Object::with_owner_for_testing(addr1);
-    let genesis_objects =
-        authority_genesis_objects(4, vec![gas_object1.clone(), gas_object2.clone()]);
-    let (authorities, _) = init_local_authorities(genesis_objects).await;
-    let authority_clients: Vec<_> = authorities.authority_clients.values().collect();
-
-    let framework_obj_ref = genesis::get_framework_object_ref();
-
-    // Make a schedule of transactions
-    let gas_ref_1 = get_latest_ref(authority_clients[0], gas_object1.id()).await;
-    let create1 =
-        crate_object_move_transaction(addr1, &key1, addr1, 100, framework_obj_ref, gas_ref_1);
-
-    do_transaction(authority_clients[0], &create1).await;
-    do_transaction(authority_clients[1], &create1).await;
-    do_transaction(authority_clients[2], &create1).await;
-
-    // Get a cert
-    let cert1 = extract_cert(&authority_clients, &authorities.committee, create1.digest()).await;
-
-    // Submit the cert to 1 authority.
-    let new_ref_1 = do_cert(authority_clients[0], &cert1).await.created[0].0;
-
-    // Make a schedule of transactions
-    let gas_ref_set = get_latest_ref(authority_clients[0], gas_object1.id()).await;
-    let create2 =
-        set_object_move_transaction(addr1, &key1, new_ref_1, 100, framework_obj_ref, gas_ref_set);
-
-    // Test 1: When we call process transaction on the second transaction, the process_transaction
-    // updates all authorities with latest objects, and then the transaction goes through
-    // on all of them. Note that one authority has processed cert 1, and none cert2,
-    // and auth 3 has no seen either.
-    authorities
-        .process_transaction(create2.clone())
-        .await
-        .unwrap();
-
-    // Check which authorities has successfully processed the cert.
-    // (NOTE: this method gets the TxInfoResponse from each authority, then reconstructs the cert)
-    let cert2 = extract_cert(&authority_clients, &authorities.committee, create2.digest()).await;
-    assert_eq!(3, cert2.auth_sign_info.signatures.len());
-}
-
 async fn get_owned_objects(
     authorities: &AuthorityAggregator<LocalAuthorityClient>,
     addr: SuiAddress,
-) -> BTreeMap<ObjectRef, Vec<PublicKeyBytes>> {
+) -> BTreeMap<ObjectRef, Vec<AuthorityPublicKeyBytes>> {
     let (owned_objects, _) = authorities
         .get_all_owned_objects(addr, Duration::from_secs(10))
         .await
@@ -758,12 +712,11 @@ async fn get_owned_objects(
 
 #[tokio::test]
 async fn test_process_certificate() {
-    let (addr1, key1) = get_key_pair();
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
     let gas_object1 = Object::with_owner_for_testing(addr1);
     let gas_object2 = Object::with_owner_for_testing(addr1);
-    let genesis_objects =
-        authority_genesis_objects(4, vec![gas_object1.clone(), gas_object2.clone()]);
-    let (authorities, _) = init_local_authorities(genesis_objects).await;
+    let (authorities, _) =
+        init_local_authorities(4, vec![gas_object1.clone(), gas_object2.clone()]).await;
     let authority_clients: Vec<_> = authorities.authority_clients.values().collect();
 
     let framework_obj_ref = genesis::get_framework_object_ref();
@@ -800,7 +753,6 @@ async fn test_process_certificate() {
     do_transaction(authority_clients[2], &create2).await;
 
     let cert2 = extract_cert(&authority_clients, &authorities.committee, create2.digest()).await;
-    println!("Hey before process_certificate");
     get_owned_objects(&authorities, addr1).await;
 
     // Test: process the certificate, including bring up to date authority 3.
@@ -816,12 +768,53 @@ async fn test_process_certificate() {
 }
 
 #[tokio::test]
+async fn test_execute_cert_to_true_effects() {
+    let (addr1, key1): (_, AccountKeyPair) = get_key_pair();
+    let gas_object1 = Object::with_owner_for_testing(addr1);
+    let gas_object2 = Object::with_owner_for_testing(addr1);
+    let (authorities, _) =
+        init_local_authorities(4, vec![gas_object1.clone(), gas_object2.clone()]).await;
+    let authority_clients: Vec<_> = authorities.authority_clients.values().collect();
+
+    let framework_obj_ref = genesis::get_framework_object_ref();
+
+    // Make a schedule of transactions
+    let gas_ref_1 = get_latest_ref(authority_clients[0], gas_object1.id()).await;
+    let create1 =
+        crate_object_move_transaction(addr1, &key1, addr1, 100, framework_obj_ref, gas_ref_1);
+
+    do_transaction(authority_clients[0], &create1).await;
+    do_transaction(authority_clients[1], &create1).await;
+    do_transaction(authority_clients[2], &create1).await;
+
+    // Get a cert
+    let cert1 = extract_cert(&authority_clients, &authorities.committee, create1.digest()).await;
+
+    authorities
+        .execute_cert_to_true_effects(&cert1)
+        .await
+        .unwrap();
+
+    // Now two (f+1) should have the cert
+    let mut count = 0;
+    for client in &authority_clients {
+        let res = client
+            .handle_transaction_info_request((*cert1.digest()).into())
+            .await
+            .unwrap();
+        if res.signed_effects.is_some() {
+            count += 1;
+        }
+    }
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn test_process_transaction_fault_success() {
     // This test exercises the 4 different possible fauling case when one authority is faulty.
     // A transaction is sent to all authories, however one of them will error out either before or after processing the transaction.
     // A cert should still be created, and sent out to all authorities again. This time
     // a different authority errors out either before or after processing the cert.
-    let genesis = sui_config::genesis::Genesis::get_default_genesis();
     for i in 0..4 {
         let mut config_before_process_transaction = LocalAuthorityClientFaultConfig::default();
         if i % 2 == 0 {
@@ -836,7 +829,6 @@ async fn test_process_transaction_fault_success() {
             config_before_process_certificate.fail_after_handle_confirmation = true;
         }
         execute_transaction_with_fault_configs(
-            &genesis,
             &[(0, config_before_process_transaction)],
             &[(1, config_before_process_certificate)],
         )
@@ -854,9 +846,7 @@ async fn test_process_transaction_fault_fail() {
         fail_before_handle_transaction: true,
         ..Default::default()
     };
-    let genesis = sui_config::genesis::Genesis::get_default_genesis();
     assert!(execute_transaction_with_fault_configs(
-        &genesis,
         &[
             (0, fail_before_process_transaction_config),
             (1, fail_before_process_transaction_config),
@@ -871,7 +861,6 @@ async fn test_process_transaction_fault_fail() {
         ..Default::default()
     };
     assert!(execute_transaction_with_fault_configs(
-        &genesis,
         &[],
         &[
             (0, fail_before_process_certificate_config),
@@ -880,4 +869,160 @@ async fn test_process_transaction_fault_fail() {
     )
     .await
     .is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_quorum_once_with_timeout() {
+    telemetry_subscribers::init_for_testing();
+
+    #[derive(Clone)]
+    struct MockAuthorityApi {
+        delay: Duration,
+        count: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait]
+    impl AuthorityAPI for MockAuthorityApi {
+        /// Initiate a new transaction to a Sui or Primary account.
+        async fn handle_transaction(
+            &self,
+            _transaction: Transaction,
+        ) -> Result<TransactionInfoResponse, SuiError> {
+            unreachable!();
+        }
+
+        /// Execute a certificate.
+        async fn handle_certificate(
+            &self,
+            _certificate: CertifiedTransaction,
+        ) -> Result<TransactionInfoResponse, SuiError> {
+            unreachable!()
+        }
+
+        /// Handle Account information requests for this account.
+        async fn handle_account_info_request(
+            &self,
+            _request: AccountInfoRequest,
+        ) -> Result<AccountInfoResponse, SuiError> {
+            unreachable!();
+        }
+
+        /// Handle Object information requests for this account.
+        async fn handle_object_info_request(
+            &self,
+            _request: ObjectInfoRequest,
+        ) -> Result<ObjectInfoResponse, SuiError> {
+            unreachable!();
+        }
+
+        /// Handle Object information requests for this account.
+        async fn handle_transaction_info_request(
+            &self,
+            _request: TransactionInfoRequest,
+        ) -> Result<TransactionInfoResponse, SuiError> {
+            let count = {
+                let mut count = self.count.lock().unwrap();
+                *count += 1;
+                *count
+            };
+
+            // timeout until the 15th request
+            if count < 15 {
+                tokio::time::sleep(self.delay).await;
+            }
+
+            let res = TransactionInfoResponse {
+                signed_transaction: None,
+                certified_transaction: None,
+                signed_effects: None,
+            };
+            Ok(res)
+        }
+
+        async fn handle_batch_stream(
+            &self,
+            _request: BatchInfoRequest,
+        ) -> Result<BatchInfoResponseItemStream, SuiError> {
+            unreachable!();
+        }
+
+        async fn handle_checkpoint(
+            &self,
+            _request: CheckpointRequest,
+        ) -> Result<CheckpointResponse, SuiError> {
+            unreachable!();
+        }
+    }
+
+    let count = Arc::new(Mutex::new(0));
+
+    let new_client = |delay: u64| {
+        let delay = Duration::from_millis(delay);
+        let count = count.clone();
+        MockAuthorityApi { delay, count }
+    };
+
+    let mut authorities = BTreeMap::new();
+    let mut clients = BTreeMap::new();
+    for _ in 0..30 {
+        let (_, sec): (_, AuthorityKeyPair) = get_key_pair();
+        let name: AuthorityName = sec.public().into();
+        authorities.insert(name, 1);
+        clients.insert(name, new_client(1000));
+    }
+
+    let committee = Committee::new(0, authorities).unwrap();
+
+    let agg = AuthorityAggregator::new_with_timeouts(
+        committee,
+        clients,
+        AuthAggMetrics::new_for_tests(),
+        TimeoutConfig {
+            serial_authority_request_interval: Duration::from_millis(50),
+            ..Default::default()
+        },
+    );
+
+    let case = |agg: AuthorityAggregator<MockAuthorityApi>, authority_request_timeout: u64| async move {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let start = Instant::now();
+        agg.quorum_once_with_timeout(
+            None,
+            None,
+            |_name, client| {
+                let digest = TransactionDigest::new([0u8; 32]);
+                let log = log.clone();
+                Box::pin(async move {
+                    // log the start time of the request
+                    log.lock().unwrap().push(Instant::now() - start);
+                    client.handle_transaction_info_request(digest.into()).await
+                })
+            },
+            Duration::from_millis(authority_request_timeout),
+            Some(Duration::from_millis(30 * 50)),
+        )
+        .await
+        .unwrap();
+        Arc::try_unwrap(log).unwrap().into_inner().unwrap()
+    };
+
+    // New requests are started every 50ms even though each request hangs for 1000ms.
+    // The 15th request succeeds, and we exit before processing the remaining authorities.
+    assert_eq!(
+        case(agg.clone(), 1000).await,
+        (0..15)
+            .map(|d| Duration::from_millis(d * 50))
+            .collect::<Vec<Duration>>()
+    );
+
+    *count.lock().unwrap() = 0;
+    // Here individual requests time out relatively quickly (100ms), but we continue increasing
+    // the parallelism every 50ms
+    assert_eq!(
+        case(agg.clone(), 100).await,
+        [0, 50, 100, 100, 150, 150, 200, 200, 200, 250, 250, 250, 300, 300, 300]
+            .iter()
+            .map(|d| Duration::from_millis(*d))
+            .collect::<Vec<Duration>>()
+    );
 }

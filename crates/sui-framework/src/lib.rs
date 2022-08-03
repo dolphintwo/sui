@@ -10,6 +10,7 @@ use once_cell::sync::Lazy;
 use std::path::Path;
 use sui_types::error::{SuiError, SuiResult};
 
+pub mod cost_calib;
 pub mod natives;
 
 pub use sui_framework_build::build_move_stdlib_modules as get_move_stdlib_modules;
@@ -67,8 +68,6 @@ pub enum EventType {
     /// deleted, the object ID must be deleted and this event will be
     /// emitted.
     DeleteObjectID,
-    /// System event: a child object is deleted along with a child ref.
-    DeleteChildObject,
     /// User-defined event
     User,
 }

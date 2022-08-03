@@ -3,11 +3,14 @@
 
 import { useParams } from 'react-router-dom';
 
+import { ReactComponent as AddressIcon } from '../../assets/AddressIcon.svg';
 import ErrorResult from '../../components/error-result/ErrorResult';
+import GoBack from '../../components/goback/GoBack';
 import Longtext from '../../components/longtext/Longtext';
 import OwnedObjects from '../../components/ownedobjects/OwnedObjects';
 import TxForID from '../../components/transactions-for-id/TxForID';
-import theme from '../../styles/theme.module.css';
+
+import styles from './AddressResult.module.css';
 
 type DataType = {
     id: string;
@@ -28,28 +31,33 @@ function AddressResult() {
 
     if (addressID !== undefined) {
         return (
-            <div className={theme.textresults} id="textResults">
-                <div>
-                    <div>Address</div>
-                    <div id="addressID">
-                        <Longtext
-                            text={addressID}
-                            category="addresses"
-                            isLink={false}
-                        />
+            <>
+                <GoBack />
+                <div className={styles.results} id="textResults">
+                    <div className={styles.addressid}>
+                        <span>
+                            <AddressIcon /> Address
+                        </span>
+                        <div id="addressID">
+                            <Longtext
+                                text={addressID}
+                                category="addresses"
+                                isLink={false}
+                            />
+                        </div>
                     </div>
-                </div>
-                <div>
-                    <div>Owned Objects</div>
                     <div>
-                        {<OwnedObjects id={addressID} byAddress={true} />}
+                        <h1>Owned Objects</h1>
+                        <div>
+                            {<OwnedObjects id={addressID} byAddress={true} />}
+                        </div>
+                    </div>
+                    <div>
+                        <h1>Transactions</h1>
+                        <TxForID id={addressID} category="address" />
                     </div>
                 </div>
-                <div>
-                    <div>Transactions</div>
-                    <TxForID id={addressID} category="address" />
-                </div>
-            </div>
+            </>
         );
     } else {
         return <ErrorResult id={addressID} errorMsg={'Something went wrong'} />;

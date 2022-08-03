@@ -27,22 +27,22 @@ use super::CheckpointStore;
 /// for the sake of keeping components separate enough to be tested without one another.
 
 pub trait CausalOrder {
-    fn get_complete_causal_order(
+    fn get_complete_causal_order<'a>(
         &self,
-        transactions: &[ExecutionDigests],
+        transactions: impl Iterator<Item = &'a ExecutionDigests>,
         ckpt_store: &mut CheckpointStore,
     ) -> SuiResult<Vec<ExecutionDigests>>;
 }
 
 pub trait EffectsStore {
-    fn get_effects(
+    fn get_effects<'a>(
         &self,
-        transactions: &[ExecutionDigests],
+        transactions: impl Iterator<Item = &'a ExecutionDigests>,
     ) -> SuiResult<Vec<Option<TransactionEffects>>>;
 
-    fn causal_order_from_effects(
+    fn causal_order_from_effects<'a>(
         &self,
-        transactions: &[ExecutionDigests],
+        transactions: impl Iterator<Item = &'a ExecutionDigests>,
         ckpt_store: &mut CheckpointStore,
     ) -> SuiResult<Vec<ExecutionDigests>> {
         let effects = self.get_effects(transactions)?;
@@ -69,6 +69,7 @@ pub trait EffectsStore {
         // Load the extra transactions in memory, we will use them quite a bit.
         // TODO: monitor memory use here.
         let tx_not_in_checkpoint: HashSet<_> = ckpt_store
+            .tables
             .extra_transactions
             .keys()
             .map(|e| e.transaction)
@@ -177,13 +178,14 @@ pub trait EffectsStore {
 }
 
 impl EffectsStore for Arc<AuthorityStore> {
-    fn get_effects(
+    fn get_effects<'a>(
         &self,
-        transactions: &[ExecutionDigests],
+        transactions: impl Iterator<Item = &'a ExecutionDigests>,
     ) -> SuiResult<Vec<Option<TransactionEffects>>> {
         Ok(self
+            .tables
             .effects
-            .multi_get(transactions.iter().map(|d| d.transaction))?
+            .multi_get(transactions.map(|d| d.transaction))?
             .into_iter()
             .map(|item| item.map(|x| x.effects))
             .collect())
@@ -194,20 +196,20 @@ impl EffectsStore for Arc<AuthorityStore> {
 pub struct TestCausalOrderNoop;
 
 impl CausalOrder for TestCausalOrderNoop {
-    fn get_complete_causal_order(
+    fn get_complete_causal_order<'a>(
         &self,
-        transactions: &[ExecutionDigests],
+        transactions: impl Iterator<Item = &'a ExecutionDigests>,
         _ckpt_store: &mut CheckpointStore,
     ) -> SuiResult<Vec<ExecutionDigests>> {
-        Ok(transactions.to_vec())
+        Ok(transactions.cloned().collect())
     }
 }
 
 /// Now this is a real causal orderer based on having an Arc<AuthorityStore> handy.
 impl CausalOrder for Arc<AuthorityStore> {
-    fn get_complete_causal_order(
+    fn get_complete_causal_order<'a>(
         &self,
-        transactions: &[ExecutionDigests],
+        transactions: impl Iterator<Item = &'a ExecutionDigests>,
         _ckpt_store: &mut CheckpointStore,
     ) -> SuiResult<Vec<ExecutionDigests>> {
         self.causal_order_from_effects(transactions, _ckpt_store)
@@ -215,12 +217,11 @@ impl CausalOrder for Arc<AuthorityStore> {
 }
 
 impl EffectsStore for BTreeMap<TransactionDigest, TransactionEffects> {
-    fn get_effects(
+    fn get_effects<'a>(
         &self,
-        transactions: &[ExecutionDigests],
+        transactions: impl Iterator<Item = &'a ExecutionDigests>,
     ) -> SuiResult<Vec<Option<TransactionEffects>>> {
         Ok(transactions
-            .iter()
             .map(|item| self.get(&item.transaction).cloned())
             .collect())
     }
@@ -232,6 +233,7 @@ mod tests {
 
     use crate::checkpoints::causal_order_effects::EffectsStore;
     use crate::checkpoints::CheckpointStore;
+    use narwhal_crypto::traits::KeyPair;
     use rand::{prelude::StdRng, SeedableRng};
     use sui_types::{
         base_types::{ExecutionDigests, ObjectDigest, ObjectID, SequenceNumber, TransactionDigest},
@@ -294,10 +296,10 @@ mod tests {
         // Open store first time
 
         let mut cps = CheckpointStore::open(
-            path,
+            &path,
             None,
             committee.epoch,
-            *k.public_key_bytes(),
+            k.public().into(),
             Arc::pin(k.copy()),
         )
         .unwrap();
@@ -331,16 +333,16 @@ mod tests {
 
         // TEST 1
         // None are recorded as new transactions in the checkpoint DB so the end sequence is empty
-        let x = effect_map.causal_order_from_effects(&input, &mut cps);
+        let x = effect_map.causal_order_from_effects(input.iter(), &mut cps);
         assert_eq!(x.unwrap().len(), 0);
 
-        cps.extra_transactions.insert(&input[0], &0).unwrap();
-        cps.extra_transactions.insert(&input[1], &1).unwrap();
-        cps.extra_transactions.insert(&input[2], &2).unwrap();
+        cps.tables.extra_transactions.insert(&input[0], &0).unwrap();
+        cps.tables.extra_transactions.insert(&input[1], &1).unwrap();
+        cps.tables.extra_transactions.insert(&input[2], &2).unwrap();
 
         // TEST 2
         // The two transactions are recorded as new so they are re-ordered and sequenced
-        let x = effect_map.causal_order_from_effects(&input[..2], &mut cps);
+        let x = effect_map.causal_order_from_effects(input[..2].iter(), &mut cps);
         assert_eq!(x.clone().unwrap().len(), 2);
         // Its in the correct order
         assert_eq!(x.unwrap(), vec![input[1], input[0]]);
@@ -352,7 +354,7 @@ mod tests {
             .map(|item| ExecutionDigests::new(item.transaction_digest, item.digest()))
             .collect();
 
-        let x = effect_map.causal_order_from_effects(&input[..2], &mut cps);
+        let x = effect_map.causal_order_from_effects(input[..2].iter(), &mut cps);
 
         assert!(x.clone().unwrap().len() == 1);
         // Its in the correct order
@@ -360,7 +362,6 @@ mod tests {
 
         // Test4
         // Many dependencies
-        println!("Test 4");
 
         // Make some transactions
         let tx = TransactionDigest::random();
@@ -376,11 +377,11 @@ mod tests {
             .map(|item| ExecutionDigests::new(item.transaction_digest, item.digest()))
             .collect();
 
-        cps.extra_transactions.insert(&input[1], &3).unwrap();
-        cps.extra_transactions.insert(&input[2], &4).unwrap();
+        cps.tables.extra_transactions.insert(&input[1], &3).unwrap();
+        cps.tables.extra_transactions.insert(&input[2], &4).unwrap();
 
         assert!(input[1..].len() == 3);
-        let x = effect_map.causal_order_from_effects(&input[1..], &mut cps);
+        let x = effect_map.causal_order_from_effects(input[1..].iter(), &mut cps);
 
         println!("result: {:?}", x);
         assert_eq!(x.clone().unwrap().len(), 2);
@@ -389,7 +390,7 @@ mod tests {
 
         // TESt 5 all
 
-        let x = effect_map.causal_order_from_effects(&input, &mut cps);
+        let x = effect_map.causal_order_from_effects(input.iter(), &mut cps);
 
         println!("result: {:?}", x);
         assert_eq!(x.clone().unwrap().len(), 4);
