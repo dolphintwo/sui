@@ -53,6 +53,19 @@ mod rpc_types_tests;
 pub type GatewayTxSeqNumber = u64;
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub enum ObjectValueKind {
+    ByImmutableReference,
+    ByMutableReference,
+    ByValue,
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
+pub enum MoveFunctionArgType {
+    Pure,
+    Object(ObjectValueKind),
+}
+
+#[derive(Serialize, Deserialize, Debug, JsonSchema)]
 pub struct TransactionEffectsResponse {
     pub certificate: SuiCertifiedTransaction,
     pub effects: SuiTransactionEffects,
@@ -844,7 +857,7 @@ impl TryFrom<MoveModulePublish> for SuiMovePackage {
 pub struct SuiTransactionData {
     pub transactions: Vec<SuiTransactionKind>,
     pub sender: SuiAddress,
-    gas_payment: SuiObjectRef,
+    pub gas_payment: SuiObjectRef,
     pub gas_budget: u64,
 }
 
@@ -1442,6 +1455,12 @@ pub struct SuiObjectInfo {
     pub type_: String,
     pub owner: Owner,
     pub previous_transaction: TransactionDigest,
+}
+
+impl SuiObjectInfo {
+    pub fn to_object_ref(&self) -> ObjectRef {
+        (self.object_id, self.version, self.digest)
+    }
 }
 
 impl From<ObjectInfo> for SuiObjectInfo {

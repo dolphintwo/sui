@@ -160,11 +160,11 @@
           }
         },
         {
-          "name": "flag",
+          "name": "sig_scheme",
           "description": "Flag of the signature scheme that is used.",
           "required": true,
           "schema": {
-            "$ref": "#/components/schemas/Base64"
+            "$ref": "#/components/schemas/SignatureScheme"
           }
         },
         {
@@ -200,8 +200,8 @@
               "value": "VHJhbnNhY3Rpb25EYXRhOjoAABdY7bkmDSqGyDbvwF8X5cWVJeQExGwtZKelsdk7LYZGgF2NKhIvzNsCAAAAAAAAACA7x9yXWrdfyGV5NTb2bmQYkFA2D2I9yIq7gwAYDN0Kj9BnwzQmQaTOqrLB29rQESsuPkj4xqk9BRZR/i5O764oE0klaDiQqUICAAAAAAAAACD2POST9RLwss+3xCoHzpEwy20FmjiNiGFTbLnFuBqajQEAAAAAAAAA6AMAAAAAAAA="
             },
             {
-              "name": "flag",
-              "value": "AA=="
+              "name": "sig_scheme",
+              "value": "ED25519"
             },
             {
               "name": "signature",
@@ -304,6 +304,48 @@
           }
         }
       ]
+    },
+    {
+      "name": "sui_getMoveFunctionArgTypes",
+      "tags": [
+        {
+          "name": "Full Node API"
+        }
+      ],
+      "description": "Return the argument types of a Move function, based on normalized Type.",
+      "params": [
+        {
+          "name": "object_id",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ObjectID"
+          }
+        },
+        {
+          "name": "module",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "function",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "Vec<MoveFunctionArgType>",
+        "required": true,
+        "schema": {
+          "type": "array",
+          "items": {
+            "$ref": "#/components/schemas/MoveFunctionArgType"
+          }
+        }
+      }
     },
     {
       "name": "sui_getObject",
@@ -2487,6 +2529,28 @@
           }
         }
       },
+      "MoveFunctionArgType": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "Pure"
+            ]
+          },
+          {
+            "type": "object",
+            "required": [
+              "Object"
+            ],
+            "properties": {
+              "Object": {
+                "$ref": "#/components/schemas/ObjectValueKind"
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
       "MoveObject": {
         "type": "object",
         "required": [
@@ -2777,6 +2841,14 @@
           }
         }
       },
+      "ObjectValueKind": {
+        "type": "string",
+        "enum": [
+          "ByImmutableReference",
+          "ByMutableReference",
+          "ByValue"
+        ]
+      },
       "Owner": {
         "oneOf": [
           {
@@ -2922,6 +2994,13 @@
             },
             "additionalProperties": false
           }
+        ]
+      },
+      "SignatureScheme": {
+        "type": "string",
+        "enum": [
+          "ED25519",
+          "Secp256k1"
         ]
       },
       "SplitCoinResponse": {

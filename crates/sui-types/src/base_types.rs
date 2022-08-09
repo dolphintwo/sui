@@ -145,8 +145,7 @@ impl SuiAddress {
         S: serde::ser::Serializer,
     {
         serializer.serialize_str(
-            &*key
-                .map(|addr| encode_bytes_hex(&addr))
+            &key.map(|addr| encode_bytes_hex(&addr))
                 .unwrap_or_else(|| "".to_string()),
         )
     }
@@ -186,7 +185,7 @@ impl TryFrom<Vec<u8>> for SuiAddress {
 impl From<&AuthorityPublicKeyBytes> for SuiAddress {
     fn from(pkb: &AuthorityPublicKeyBytes) -> Self {
         let mut hasher = Sha3_256::default();
-        hasher.update(&[AuthorityPublicKey::FLAG]);
+        hasher.update(&[AuthorityPublicKey::SIGNATURE_SCHEME.flag()]);
         hasher.update(pkb);
         let g_arr = hasher.finalize();
 
@@ -199,7 +198,7 @@ impl From<&AuthorityPublicKeyBytes> for SuiAddress {
 impl<T: SuiPublicKey> From<&T> for SuiAddress {
     fn from(pk: &T) -> Self {
         let mut hasher = Sha3_256::default();
-        hasher.update(&[T::FLAG]);
+        hasher.update(&[T::SIGNATURE_SCHEME.flag()]);
         hasher.update(pk);
         let g_arr = hasher.finalize();
 

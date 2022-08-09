@@ -18,6 +18,7 @@ use crate::authority::*;
 use crate::safe_client::SafeClient;
 
 use crate::authority_client::{AuthorityAPI, BatchInfoResponseItemStream};
+use crate::epoch::epoch_store::EpochStore;
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use futures::stream;
@@ -27,8 +28,8 @@ use std::fs;
 use std::sync::Arc;
 use sui_types::messages::{
     AccountInfoRequest, AccountInfoResponse, BatchInfoRequest, BatchInfoResponseItem,
-    CertifiedTransaction, ObjectInfoRequest, ObjectInfoResponse, Transaction,
-    TransactionInfoRequest, TransactionInfoResponse,
+    CertifiedTransaction, EpochRequest, EpochResponse, ObjectInfoRequest, ObjectInfoResponse,
+    Transaction, TransactionInfoRequest, TransactionInfoResponse,
 };
 use sui_types::object::Object;
 
@@ -54,11 +55,16 @@ pub(crate) async fn init_state(
     authority_key: AuthorityKeyPair,
     store: Arc<AuthorityStore>,
 ) -> AuthorityState {
+    let dir = env::temp_dir();
+    let epoch_path = dir.join(format!("DB_{:?}", ObjectID::random()));
+    fs::create_dir(&epoch_path).unwrap();
+    let epoch_store = Arc::new(EpochStore::new(epoch_path));
     AuthorityState::new(
         committee,
         authority_key.public().into(),
         Arc::pin(authority_key),
         store,
+        epoch_store,
         None,
         None,
         None,
@@ -445,8 +451,8 @@ async fn test_batch_store_retrieval() {
         .expect("Retrieval failed!");
 
     assert_eq!(4, batches.len());
-    assert_eq!(10, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(40, batches.last().unwrap().batch.next_sequence_number);
+    assert_eq!(10, batches.first().unwrap().data().next_sequence_number);
+    assert_eq!(40, batches.last().unwrap().data().next_sequence_number);
 
     assert_eq!(30, transactions.len());
 
@@ -456,8 +462,8 @@ async fn test_batch_store_retrieval() {
         .expect("Retrieval failed!");
 
     assert_eq!(2, batches.len());
-    assert_eq!(50, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(60, batches.last().unwrap().batch.next_sequence_number);
+    assert_eq!(50, batches.first().unwrap().data().next_sequence_number);
+    assert_eq!(60, batches.last().unwrap().data().next_sequence_number);
 
     assert_eq!(10, transactions.len());
 
@@ -467,8 +473,8 @@ async fn test_batch_store_retrieval() {
         .expect("Retrieval failed!");
 
     assert_eq!(3, batches.len());
-    assert_eq!(30, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(50, batches.last().unwrap().batch.next_sequence_number);
+    assert_eq!(30, batches.first().unwrap().data().next_sequence_number);
+    assert_eq!(50, batches.last().unwrap().data().next_sequence_number);
 
     assert_eq!(20, transactions.len());
 
@@ -478,8 +484,8 @@ async fn test_batch_store_retrieval() {
         .expect("Retrieval failed!");
 
     assert_eq!(3, batches.len());
-    assert_eq!(90, batches.first().unwrap().batch.next_sequence_number);
-    assert_eq!(115, batches.last().unwrap().batch.next_sequence_number);
+    assert_eq!(90, batches.first().unwrap().data().next_sequence_number);
+    assert_eq!(115, batches.last().unwrap().data().next_sequence_number);
 
     assert_eq!(25, transactions.len());
 
@@ -489,7 +495,7 @@ async fn test_batch_store_retrieval() {
         .expect("Retrieval failed!");
 
     assert_eq!(1, batches.len());
-    assert_eq!(115, batches.first().unwrap().batch.next_sequence_number);
+    assert_eq!(115, batches.first().unwrap().data().next_sequence_number);
 
     assert_eq!(5, transactions.len());
 
@@ -563,6 +569,10 @@ impl AuthorityAPI for TrustworthyAuthorityClient {
         _request: CheckpointRequest,
     ) -> Result<CheckpointResponse, SuiError> {
         unimplemented!();
+    }
+
+    async fn handle_epoch(&self, _request: EpochRequest) -> Result<EpochResponse, SuiError> {
+        unimplemented!()
     }
 
     /// Handle Batch information requests for this authority.
@@ -677,7 +687,11 @@ impl AuthorityAPI for ByzantineAuthorityClient {
         &self,
         _request: CheckpointRequest,
     ) -> Result<CheckpointResponse, SuiError> {
-        unimplemented!();
+        unimplemented!()
+    }
+
+    async fn handle_epoch(&self, _request: EpochRequest) -> Result<EpochResponse, SuiError> {
+        unimplemented!()
     }
 
     /// Handle Batch information requests for this authority.
@@ -750,19 +764,8 @@ async fn test_safe_batch_stream() {
     authorities.insert(public_key_bytes, 1);
     let committee = Committee::new(0, authorities).unwrap();
     // Create an authority
-    let store = Arc::new(AuthorityStore::open(&path, None));
-    let state = AuthorityState::new(
-        committee.clone(),
-        public_key_bytes,
-        Arc::pin(authority_key),
-        store.clone(),
-        None,
-        None,
-        None,
-        &sui_config::genesis::Genesis::get_default_genesis(),
-        &prometheus::Registry::new(),
-    )
-    .await;
+    let store = Arc::new(AuthorityStore::open(&path.join("store"), None));
+    let state = init_state(committee.clone(), authority_key, store).await;
 
     // Happy path:
     let auth_client = TrustworthyAuthorityClient::new(state);
@@ -797,20 +800,10 @@ async fn test_safe_batch_stream() {
 
     // Byzantine cases:
     let (_, authority_key): (_, AuthorityKeyPair) = get_key_pair();
-    let public_key_bytes_b = authority_key.public().into();
-    let state_b = AuthorityState::new(
-        committee.clone(),
-        public_key_bytes_b,
-        Arc::pin(authority_key),
-        store,
-        None,
-        None,
-        None,
-        &sui_config::genesis::Genesis::get_default_genesis(),
-        &prometheus::Registry::new(),
-    )
-    .await;
+    let state_b =
+        AuthorityState::new_for_testing(committee.clone(), &authority_key, None, None, None).await;
     let auth_client_from_byzantine = ByzantineAuthorityClient::new(state_b);
+    let public_key_bytes_b = authority_key.public().into();
     let safe_client_from_byzantine = SafeClient::new(
         auth_client_from_byzantine,
         committee.clone(),
